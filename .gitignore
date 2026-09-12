@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 运行时状态与日志（含个人账户数据）
+data/
+*.log
+bot.lock*
+
+# 本地备份
+*.bak_*
+flow_backup_*.json
+*_backup_*.json
+*_bak_*.json
+
+# 环境变量与密钥
+.env
+*.key
+
+# 编辑器/系统
+.DS_Store
+Thumbs.db
