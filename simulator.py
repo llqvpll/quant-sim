@@ -344,7 +344,7 @@ class Simulator:
         self.save()
         return snap
 
-    def log_signal(self, code: str, name: str, signal: str, confidence: float, reason: str, executed: bool, note: str = ""):
+    def log_signal(self, code: str, name: str, signal: str, confidence: float, reason: str, executed: bool, note: str = "", hallucination_risk: bool = False):
         """记录 AI 信号"""
         self.state["signal_log"].append({
             "time": datetime.now().isoformat(),
@@ -355,6 +355,7 @@ class Simulator:
             "reason": reason,
             "executed": executed,
             "note": note,
+            "hallucination_risk": bool(hallucination_risk),
         })
         self.save()
 

@@ -247,11 +247,15 @@ class QuantBot:
                 if rule_ctx:
                     question_full += "\n" + rule_ctx
                 result = self.ai.analyze_stock(code, question_full, technical=tech_txt, extra=account_ctx,
-                                               news=news_txt, experience=self._experience_txt)
+                                               news=news_txt, experience=self._experience_txt,
+                                               verify_price=price, expected_name=name)
                 report["ai_calls"] += 1
                 signal = result.get("signal", "error")
                 conf = result.get("confidence", 0)
                 self._cache_signal(code, signal, conf, result.get("reason", ""))
+                # 防交易幻觉: 若信号被判定为幻觉风险, 打印醒目警告(信号已被降级/拦截)
+                if result.get("hallucination_risk"):
+                    print(f"  ⚠️ 幻觉风险 [{name}({code})]: {result.get('verify_notes', '')}")
 
             if signal == "error":
                 report["error"] += 1
@@ -315,6 +319,7 @@ class QuantBot:
             self.sim.log_signal(code, name, signal, conf,
                                 result.get("reason", "")[:200],
                                 executed=bool(action and action.get("success")),
+                                hallucination_risk=result.get("hallucination_risk", False),
                                 note=f"价格{price:.2f}" + (f"| 消息面:{news_txt.replace(chr(10), ' ')[:60]}" if news_txt else ""))
 
         # 3. 更新持仓价格 + 止损止盈

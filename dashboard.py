@@ -376,11 +376,12 @@ function renderSignals(state) {
         const color = colorMap[sig] || '#999';
         const label = { buy: '买入', sell: '卖出', wait: '观望', hold: '持有', error: '错误' }[sig] || sig;
         const conf = (s.confidence == null) ? '--' : (Number(s.confidence) * 100).toFixed(0) + '%';
+        const hallu = s.hallucination_risk ? '<span style="color:#ff4d4f;font-weight:bold">⚠幻觉</span>' : '<span style="color:#8b95a7">正常</span>';
         html += '<tr><td>' + esc(String(s.time || '').slice(0, 16)) + '</td>'
               + '<td>' + esc(s.name || '') + '<br><small>' + esc(s.code || '') + '</small></td>'
               + '<td style="color:' + color + ';font-weight:bold">' + label + '</td>'
               + '<td>' + conf + '</td>'
-              + '<td>' + (s.executed ? '<span style="color:#52c41a">已执行</span>' : '<span style="color:#faad14">未执行</span>') + '</td></tr>';
+              + '<td>' + hallu + ' / ' + (s.executed ? '<span style="color:#52c41a">已执行</span>' : '<span style="color:#faad14">未执行</span>') + '</td></tr>';
     }
     tbody.innerHTML = html;
 }

@@ -16,12 +16,22 @@ AI 信号集成层
 
 import json
 import re
+import sys
 import time
 import urllib.request
 import gzip
 
 LANGFLOW_BASE = "http://127.0.0.1:7860"
 FLOW_ID = "c25e4d72-5593-48fe-945e-5e3bdde16220"  # A股量化交易分析
+
+# ===================== 防交易幻觉(grounding)配置 =====================
+# 交易幻觉: AI 凭空编造标的/价格/理由, 系统却据此下单或记成事实。
+# 下面这组开关用于在信号落地前做"真实性校验", 把幻觉信号降级/拦截。
+GROUND_SYMBOL = True                  # 校验 AI 是否分析了正确的标的(代码/名称)
+PRICE_TOLERANCE_PCT = 8.0             # AI 陈述的"现价"与真实行情偏差容忍(%)，超此视为编造
+LOW_TRUST_KEYWORD_CONF_CAP = 0.40     # 关键词兜底解析的置信度上限(非结构化, 低可信)
+REQUIRE_EXPLICIT_DECISION = True      # 关键词兜底下, 信号不明确则强制降级为观望
+GROUND_STOP_TAKE_LOGIC = True         # 校验 止损/止盈 与信号方向是否自相矛盾(逻辑幻觉)
 
 
 class AIAnalyzer:
@@ -55,7 +65,8 @@ class AIAnalyzer:
     def analyze_stock(self, symbol: str, question: str = "现在适合买入吗？请给出明确的操作建议（买入/持有/观望/卖出）。",
                       technical: str = None, extra: str = None,
                       news: str = None, experience: str = None,
-                      as_of: str = None) -> dict:
+                      as_of: str = None,
+                      verify_price: float = None, expected_name: str = None) -> dict:
         """分析一只股票，返回结构化信号 —— 多重预测: 技术面 + 消息面 + 历史经验
         technical:   技术指标摘要(如 "MA5 1295 MA10 1307 ... 趋势: 短期偏空")
         extra:       附加上下文(账户资金/手续费等)
@@ -98,8 +109,10 @@ class AIAnalyzer:
             text = self._extract_text(resp)
             if not text:
                 return {"signal": "unknown", "confidence": 0.0, "reason": "AI 无输出", "raw": "",
-                        "symbol": symbol, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}
-            return self._parse_signal(text, symbol)
+                        "symbol": symbol, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "hallucination_risk": True, "ungrounded": True,
+                        "verify_notes": "AI 无输出(无法落地真实信号)"}
+            return self._parse_signal(text, symbol, verify_price=verify_price, expected_name=expected_name)
         except Exception as e:
             return {"signal": "error", "confidence": 0.0,
                     "reason": f"AI 调用失败: {type(e).__name__}: {str(e)[:200]}", "raw": "",
@@ -147,6 +160,10 @@ class AIAnalyzer:
         except (TypeError, ValueError):
             confidence = 50.0
         confidence = max(0.0, min(confidence, 100.0)) / 100.0
+        # 防幻觉: 要求 AI 在 JSON 中回显分析对象的代码, 用于后续校验是否分析错标的
+        ai_symbol = str(data.get("symbol", "")).strip() or None
+        if ai_symbol is not None and not re.fullmatch(r"\d{6}", ai_symbol):
+            ai_symbol = None
 
         def _num(key):
             value = data.get(key)
@@ -171,17 +188,19 @@ class AIAnalyzer:
             "position_pct": position_pct,
             "reason": str(data.get("reason", ""))[:500],
             "risk": str(data.get("risk", ""))[:300],
+            "symbol_echo": ai_symbol,
             "parsed_from": "json",
         }
 
     @classmethod
-    def _parse_signal(cls, text: str, symbol: str) -> dict:
-        """从分析报告中解析买卖信号"""
+    def _parse_signal(cls, text: str, symbol: str, verify_price: float = None,
+                      expected_name: str = None) -> dict:
+        """从分析报告中解析买卖信号，并做防幻觉校验"""
         parsed = cls._parse_json_signal(text)
         if parsed:
             parsed.update({"symbol": symbol, "raw": text,
                            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")})
-            return parsed
+            return cls._ground_signal(parsed, text, symbol, verify_price, expected_name)
 
         # 兼容旧版: 结构化输出失败时退回关键词匹配
         text_lower = text.lower()
@@ -190,6 +209,7 @@ class AIAnalyzer:
         # 1. 找明确的建议行
         signal = "hold"
         confidence = 0.5
+        advice_hit = False  # 信号是否来自"明确建议区"(而非全文偶然扫到的词)
 
         # 交易建议块
         buy_kw = ["买入", "建议买入", "转为买入", "轻仓买入", "可买入", "buy"]
@@ -226,6 +246,7 @@ class AIAnalyzer:
                 break
 
         # 兜底: 若建议区未命中, 全文找强信号词
+        advice_hit = (signal != "hold")  # 建议区是否命中明确信号
         if signal == "hold":
             for line in reason_lines:
                 has_neg = any(k in line for k in neg_kw)
@@ -246,9 +267,14 @@ class AIAnalyzer:
         stop_loss = None
         m = re.search(r"止损(?:位|价|点)?[：:]\s*[\d.]+", text)
         if m:
-            stop_loss = re.findall(r"[\d.]+", m.group())[-1]
+            _nums = re.findall(r"[\d.]+", m.group())
+            if _nums:
+                try:
+                    stop_loss = float(_nums[-1])
+                except ValueError:
+                    stop_loss = None
 
-        return {
+        result = {
             "signal": signal,
             "confidence": round(confidence, 2),
             "stop_loss": stop_loss,
@@ -257,16 +283,135 @@ class AIAnalyzer:
             "symbol": symbol,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "parsed_from": "keyword",
+            "_advice_hit": advice_hit,
         }
+        return cls._ground_signal(result, text, symbol, verify_price, expected_name)
+
+
+    # ===================== 防交易幻觉(grounding) =====================
+    @staticmethod
+    def _extract_codes(text: str):
+        """从文本中提取所有 6 位股票代码"""
+        return set(re.findall(r"\b\d{6}\b", text or ""))
+
+    @classmethod
+    def _ground_signal(cls, result: dict, text: str, symbol: str,
+                       verify_price: float = None, expected_name: str = None) -> dict:
+        """防交易幻觉：校验 AI 输出是否基于真实数据，而非凭空编造。
+        返回带 hallucination_risk / ungrounded / verify_notes 的 result。
+
+        校验维度：
+          1) 标的真实性：AI 回显的代码(symbol_echo)是否等于请求代码；或在自由文本里
+             是否把决策对象张冠李戴到别的代码上。
+          2) 价格真实性：AI 陈述的"现价/最新收盘"是否与真实行情吻合（偏差过大＝编造）。
+          3) 逻辑自洽：买入信号的止损是否低于现价、卖出信号的止盈是否高于现价。
+          4) 低可信兜底：非结构化(关键词)解析一律降权封顶，信号不明确强制观望。
+        """
+        notes = []
+        risk = False
+        sig = result.get("signal")
+
+        # 1) 标的真实性
+        if GROUND_SYMBOL:
+            ai_symbol = result.get("symbol_echo")
+            if ai_symbol and ai_symbol != symbol:
+                risk = True
+                notes.append(f"AI 回显代码 {ai_symbol} ≠ 请求 {symbol}（可能分析错标的）")
+                result["signal"] = "wait"
+                result["confidence"] = min(result.get("confidence", 0.0), 0.3)
+            elif result.get("parsed_from") == "keyword":
+                # 自由文本模式：若文中出现别的 6 位代码却完全没提到请求代码，疑似张冠李戴
+                codes = cls._extract_codes(text)
+                if codes and symbol not in codes:
+                    risk = True
+                    notes.append(f"AI 文本未提及请求标的 {symbol}，反而提到 {sorted(codes)}（疑似分析错标的）")
+                    result["signal"] = "wait"
+                    result["confidence"] = min(result.get("confidence", 0.0), 0.3)
+            # 名称校验（可选）：AI 把另一只股票名称当成本标的讨论
+            if expected_name and expected_name not in ("", None):
+                # 仅当文本里出现了明显是"另一家公司"的知名代码/名称且无请求代码时才提示（不强制，避免误杀）
+                pass
+
+        # 2) 价格真实性 + 3) 逻辑自洽
+        if verify_price and verify_price > 0:
+            for label in ("最新收盘", "收盘价", "现价", "当前价", "最新价", "当前价格"):
+                m = re.search(label + r"[：: ]*\s*([0-9]+(?:\.[0-9]+)?)", text or "")
+                if m:
+                    try:
+                        cited = float(m.group(1))
+                    except ValueError:
+                        cited = None
+                    if cited:
+                        dev = abs(cited - verify_price) / verify_price * 100
+                        if dev > PRICE_TOLERANCE_PCT:
+                            risk = True
+                            notes.append(f"AI 陈述{label}{cited} 与真实行情 {verify_price:.2f} 偏差 {dev:.0f}%（疑似编造）")
+                    break
+            if GROUND_STOP_TAKE_LOGIC:
+                sl = result.get("stop_loss")
+                tp = result.get("take_profit")
+                if sig == "buy" and isinstance(sl, (int, float)) and sl >= verify_price:
+                    risk = True
+                    notes.append(f"买入信号但止损 {sl} 不低于现价 {verify_price:.2f}（逻辑矛盾，疑似编造）")
+                if sig == "sell" and isinstance(tp, (int, float)) and tp <= verify_price:
+                    risk = True
+                    notes.append(f"卖出信号但止盈 {tp} 不高于现价 {verify_price:.2f}（逻辑矛盾，疑似编造）")
+
+        # 4) 低可信兜底：非结构化(关键词)解析一律降权封顶，且只有"明确建议区"里
+        #    出现的买卖才算数；全文偶然扫到的买卖词(典型幻觉/歧义)直接作废。
+        if result.get("parsed_from") == "keyword":
+            result["low_confidence"] = True
+            capped = min(result.get("confidence", 0.0), LOW_TRUST_KEYWORD_CONF_CAP)
+            if capped < result.get("confidence", 0.0):
+                notes.append(f"非结构化(关键词兜底)解析，置信度封顶 {LOW_TRUST_KEYWORD_CONF_CAP:.0%}")
+            result["confidence"] = round(capped, 2)
+            if sig in ("buy", "sell") and not result.get("_advice_hit"):
+                notes.append("买卖词仅出现在全文叙述中(非明确建议区)，疑似幻觉/歧义，已作废")
+                result["signal"] = "wait"
+
+        # 5) 任何被判定为幻觉风险的买卖信号，一律拦截执行(降级观望)，不拿假信号下单
+        if risk and result.get("signal") in ("buy", "sell"):
+            notes.append("存在幻觉风险，已拦截执行并降级为观望")
+            result["signal"] = "wait"
+            result["confidence"] = min(result.get("confidence", 0.0), 0.3)
+
+        result["hallucination_risk"] = risk
+        result["ungrounded"] = bool(result.get("low_confidence", False) or risk)
+        result["verify_notes"] = "; ".join(notes)
+        if notes:
+            result["reason"] = (result.get("reason", "") or "") + " 【校验：" + "; ".join(notes) + "】"
+        return result
+
+    # ===================== 离线自检(无需 API) =====================
+    @classmethod
+    def selftest_grounding(cls):
+        """不调用 Langflow/DeepSeek，直接对若干构造样本跑解析+校验，验证护栏是否生效。"""
+        print("=== 防幻觉护栏离线自检 ===")
+        samples = [
+            ("规范JSON-正常", '{"signal":"buy","confidence":80,"symbol":"600519","stop_loss":1250,"take_profit":1400,"reason":"多头排列，现价1295可介入"}', 1295.0),
+            ("规范JSON-错标的", '{"signal":"buy","confidence":80,"symbol":"000001","stop_loss":10,"take_profit":12,"reason":"买入平安银行"}', 1295.0),
+            ("自由文本-明确买入", "综合来看，建议买入，止损位1300，仓位15%。", 1295.0),
+            ("自由文本-编造现价", "当前价格 9999.00，建议买入。", 1295.0),
+            ("自由文本-无明确信号", "本报告仅供参考，市场有风险，投资需谨慎。", 1295.0),
+            ("规范JSON-止损矛盾", '{"signal":"buy","confidence":70,"symbol":"600519","stop_loss":1350,"take_profit":1400,"reason":"买入"}', 1295.0),
+        ]
+        for name, txt, price in samples:
+            r = cls._parse_signal(txt, "600519", verify_price=price, expected_name="贵州茅台")
+            print(f"[{name}] signal={r['signal']} conf={r['confidence']} "
+                  f"risk={r.get('hallucination_risk')} from={r.get('parsed_from')} | {r.get('verify_notes','')}")
 
 
 if __name__ == "__main__":
-    # 自测: 分析贵州茅台
-    analyzer = AIAnalyzer()
-    print("正在调用 AI 分析 600519 ...")
-    result = analyzer.analyze_stock("600519")
-    print(f"信号: {result['signal']} | 置信度: {result['confidence']} | 止损: {result.get('stop_loss')}")
-    print(f"解析方式: {result.get('parsed_from')} | 趋势: {result.get('trend')} | "
-          f"仓位: {result.get('position_pct')} | 止盈: {result.get('take_profit')}")
-    print(f"原因摘要: {result['reason'][:200]}")
-    print(f"风险提示: {str(result.get('risk'))[:120]}")
+    if len(sys.argv) > 1 and sys.argv[1] == "selftest":
+        AIAnalyzer.selftest_grounding()
+    else:
+        # 自测: 分析贵州茅台(需本地 Langflow + DeepSeek)
+        analyzer = AIAnalyzer()
+        print("正在调用 AI 分析 600519 ...")
+        result = analyzer.analyze_stock("600519")
+        print(f"信号: {result['signal']} | 置信度: {result['confidence']} | 止损: {result.get('stop_loss')}")
+        print(f"解析方式: {result.get('parsed_from')} | 趋势: {result.get('trend')} | "
+              f"仓位: {result.get('position_pct')} | 止盈: {result.get('take_profit')}")
+        print(f"幻觉风险: {result.get('hallucination_risk')} | 校验: {result.get('verify_notes','')}")
+        print(f"原因摘要: {result['reason'][:200]}")
+        print(f"风险提示: {str(result.get('risk'))[:120]}")

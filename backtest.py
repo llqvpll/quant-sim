@@ -24,6 +24,9 @@ from simulator import Simulator
 from ai_signal import AIAnalyzer
 from market_data import MarketData
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+
 # 回测参数
 DEFAULT_DAYS = 60        # 回测多少个交易日
 INITIAL_CAPITAL = None   # None = 用模拟器默认资金(5万, 与实盘一致); 需要时传具体数字
@@ -60,7 +63,7 @@ class Backtest:
             return {"error": f"K线不足: {len(klines)} 根", "trades": [], "net_values": []}
 
         sim = Simulator(state_file=os.path.join(
-            r"C:\Users\10716\Desktop\agent\quant-sim\data", f"backtest_{symbol}.json"),
+            DATA_DIR, f"backtest_{symbol}.json"),
             capital=INITIAL_CAPITAL)
         # 重置
         if os.path.exists(sim.state_file):
@@ -83,7 +86,7 @@ class Backtest:
             # 简化方案: 每隔 5 天调用一次 AI 决策(减少 API 调用), 用当天收盘价判断。
             if i % 5 == 0 or i == start_idx:
                 question = f"今天是{date}，现在适合买入吗？请给出明确建议（买入/持有/观望/卖出）。"
-                result = self.ai.analyze_stock(symbol, question, as_of=date)
+                result = self.ai.analyze_stock(symbol, question, as_of=date, verify_price=price)
                 signal = result.get("signal", "wait")
                 conf = result.get("confidence", 0)
             else:
