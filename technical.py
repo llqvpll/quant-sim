@@ -27,9 +27,16 @@ class TechnicalAnalyzer:
     def __init__(self):
         self.md = MarketData()
 
-    def get_indicators(self, symbol: str, limit: int = 120) -> dict:
-        """计算单只股票的技术指标摘要"""
+    def get_indicators(self, symbol: str, limit: int = 120, as_of: str = None) -> dict:
+        """计算单只股票的技术指标摘要
+
+        as_of: 回测用截止日期 "YYYY-MM-DD"，只取该日及之前的K线，避免未来函数。
+               不传则为实盘(看最新数据)。
+        """
         klines = self.md.get_kline(symbol, "1d", limit)
+        if as_of:
+            # K线按日期升序, 截断到 as_of(含)当日, 回测不会"偷看"之后的走势
+            klines = [k for k in klines if k["date"] <= as_of]
         if len(klines) < 25:
             return {}
 

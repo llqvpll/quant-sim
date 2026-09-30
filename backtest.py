@@ -23,6 +23,7 @@ from datetime import datetime
 from simulator import Simulator
 from ai_signal import AIAnalyzer
 from market_data import MarketData
+from technical import TechnicalAnalyzer
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -30,7 +31,11 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 # 回测参数
 DEFAULT_DAYS = 60        # 回测多少个交易日
 INITIAL_CAPITAL = None   # None = 用模拟器默认资金(5万, 与实盘一致); 需要时传具体数字
-START_BUDGET_RATIO = 0.15  # 每次买入用总资产15%
+
+# 与实盘一致的买入风控口径, 避免回测虚高
+BT_CONF_BUY_THRESHOLD = 0.65  # 置信度低于此值不买入(与 main.py CONFIDENCE_BUY_THRESHOLD 对齐)
+BT_BASE_RATIO = 0.15          # 基准仓位(置信度 0.65 对应)
+BT_MAX_RATIO = 0.25           # 满置信仓位上限
 
 
 class Backtest:
@@ -41,6 +46,7 @@ class Backtest:
         self.days = days
         self.md = MarketData()
         self.ai = AIAnalyzer()
+        self.ta = TechnicalAnalyzer()
         self.results = {}
 
     def run(self) -> dict:
@@ -85,8 +91,16 @@ class Backtest:
             # 丢弃该日期之后的K线, 因此不会再有未来函数(之前那版回测是偷看今天的行情)。
             # 简化方案: 每隔 5 天调用一次 AI 决策(减少 API 调用), 用当天收盘价判断。
             if i % 5 == 0 or i == start_idx:
-                question = f"今天是{date}，现在适合买入吗？请给出明确建议（买入/持有/观望/卖出）。"
-                result = self.ai.analyze_stock(symbol, question, as_of=date, verify_price=price)
+                question = f"今天是{date}，基于截至当天的历史数据，现在适合买入吗？请给出明确建议（买入/持有/观望/卖出）。"
+                # 技术面也只喂"截止当天"的指标, 与 as_of 口径一致, 杜绝未来函数
+                tech_txt = ""
+                try:
+                    ind = self.ta.get_indicators(symbol, as_of=date)
+                    tech_txt = ind.get("signal_txt", "") if ind else ""
+                except Exception:
+                    tech_txt = ""
+                result = self.ai.analyze_stock(symbol, question, technical=tech_txt,
+                                               as_of=date, verify_price=price)
                 signal = result.get("signal", "wait")
                 conf = result.get("confidence", 0)
             else:
@@ -94,13 +108,22 @@ class Backtest:
 
             # 执行信号
             if signal == "buy" and symbol not in sim.state["positions"]:
-                budget = sim.total_assets * START_BUDGET_RATIO
-                shares = int(budget / price / 100) * 100
-                if shares >= 100:
-                    r = sim.buy(symbol, symbol, price, shares, reason=f"回测买入 {date}")
-                    if r["success"]:
-                        trades.append({"date": date, "action": "BUY", "price": price,
-                                       "shares": shares, "signal": signal, "conf": conf})
+                # 与实盘一致的置信度门槛 + 动态仓位(避免回测虚高):
+                # 置信度低于阈值只观望; 置信越高仓位越大(0.65→15%, 1.0→25%)
+                if conf < BT_CONF_BUY_THRESHOLD:
+                    pass
+                else:
+                    ratio = BT_BASE_RATIO + (conf - BT_CONF_BUY_THRESHOLD) * \
+                            (BT_MAX_RATIO - BT_BASE_RATIO) / (1.0 - BT_CONF_BUY_THRESHOLD)
+                    ratio = min(ratio, BT_MAX_RATIO)
+                    budget = sim.total_assets * ratio
+                    shares = int(budget / price / 100) * 100
+                    if shares >= 100:
+                        r = sim.buy(symbol, symbol, price, shares,
+                                    reason=f"回测买入 {date} (置信{conf:.0%})")
+                        if r["success"]:
+                            trades.append({"date": date, "action": "BUY", "price": price,
+                                           "shares": shares, "signal": signal, "conf": conf})
             elif signal == "sell" and symbol in sim.state["positions"]:
                 r = sim.sell(symbol, price, -1, reason=f"回测卖出 {date}")
                 if r["success"]:
