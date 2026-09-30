@@ -32,52 +32,13 @@ LF_PORT = 7860
 SCAN_N = 10
 
 
-def _has_requests(py):
-    """判断某个 python 解释器是否带 requests 模块"""
-    try:
-        r = subprocess.run([py, "-c", "import requests"],
-                           capture_output=True, timeout=20)
-        return r.returncode == 0
-    except Exception:
-        return False
-
-
 def resolve_python():
-    """自动探测可用的 python 解释器:
-    优先当前解释器(若带 requests), 否则找系统 python / py -3 等"""
-    candidates = []
-    # 1) 当前解释器
-    candidates.append(sys.executable)
-    # 2) PATH 里的 python / python3
-    for name in ("python", "python3"):
-        try:
-            candidates.append(name)
-        except Exception:
-            pass
-    # 3) py 启动器 (Windows)
-    for ver in ("-3.10", "-3.11", "-3.12", "-3.13", "-3"):
-        candidates.append(["py", ver])
-    seen = set()
-    for cand in candidates:
-        key = tuple(cand) if isinstance(cand, list) else cand
-        if key in seen:
-            continue
-        seen.add(key)
-        if isinstance(cand, list):
-            try:
-                r = subprocess.run(cand + ["-c", "import requests"],
-                                   capture_output=True, timeout=20)
-                if r.returncode == 0:
-                    log(f"[OK] 使用解释器: {cand[0]} {cand[1]} (带 requests)")
-                    return cand
-            except Exception:
-                continue
-        else:
-            if _has_requests(cand):
-                log(f"[OK] 使用解释器: {cand} (带 requests)")
-                return cand
-    # 全都不行 -> 退回当前解释器(后续会报错提示)
-    log("[!!] 未找到带 requests 的 python 解释器, 用当前解释器尝试")
+    """返回用于启动机器人/看板的 python 解释器。
+
+    本项目运行脚本(机器人/看板)已改为零第三方依赖(仅标准库 + 独立运行的 Langflow 服务端),
+    因此直接用当前解释器即可, 不再要求 requests。
+    """
+    log(f"[OK] 使用解释器: {sys.executable} (标准库, 零第三方依赖)")
     return sys.executable
 
 

@@ -15,10 +15,8 @@
 """
 
 import json
-import time
-import urllib.parse
 
-import requests
+import http_util
 
 # 东方财富搜索新闻接口
 EM_SEARCH_URL = "https://search-api-web.eastmoney.com/search/jsonp"
@@ -83,7 +81,7 @@ class NewsAnalyzer:
         if score > 0.2:
             sentiment = "偏多"
         elif score < -0.2:
-            sentiment = "偏空"
+            sentiment = "中性" if score == 0 else "偏空"
         else:
             sentiment = "中性"
 
@@ -115,10 +113,10 @@ class NewsAnalyzer:
                     }
                 },
             }
-            r = requests.get(EM_SEARCH_URL,
-                             params={"cb": "cb", "param": json.dumps(param, ensure_ascii=False)},
-                             headers=HEADERS, timeout=10)
-            text = r.text
+            # 加 cb= 让接口返回 JSONP 包裹 cb({...}); 去掉包裹再解析
+            text = http_util.get_text(EM_SEARCH_URL,
+                                      params={"cb": "cb", "param": json.dumps(param, ensure_ascii=False)},
+                                      headers=HEADERS, timeout=10)
             # 去掉 JSONP 包装: cb({...})
             if text.startswith("cb("):
                 text = text[3:-1]
@@ -133,13 +131,7 @@ class NewsAnalyzer:
                     "mediaName": it.get("mediaName", ""),
                 })
             return result
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            # 网络/解析失败时告警(不再静默吞掉), 但仍返回空列表避免中断主流程
+            print(f"⚠️ 新闻接口获取失败({symbol}): {type(exc).__name__}: {exc}")
             return []
-
-
-if __name__ == "__main__":
-    na = NewsAnalyzer()
-    for code in ["300816", "000890", "600519"]:
-        print(f"\n=== {code} ===")
-        r = na.get_news_summary(code)
-        print(r["txt"])
