@@ -202,6 +202,45 @@ class Simulator:
         amount = price * 100
         return (self._commission(amount) * 2 + amount * STAMP_TAX_RATE) / amount * 100
 
+    @staticmethod
+    def _realized_pnl_from_orders(orders: list) -> float:
+        """按 FIFO 配对买卖, 计算真实已平仓盈亏(正确处理"部分卖出但仍持仓")。
+
+        逐笔扫描订单: 买入建立成本批次(含佣金), 卖出按先买先卖消耗批次;
+        实现收益 = 卖出净收入(扣佣+印花税) − 对应批次成本。未清仓部分不计入,
+        由 market_value / 浮动盈亏体现, 避免重复计算。
+        """
+        lots = {}  # code -> [[剩余股数, 每股含佣成本]]
+        realized = 0.0
+        for o in orders:
+            code = o.get("code")
+            act = o.get("action")
+            if act == "BUY":
+                shares = o.get("shares", 0)
+                if not shares:
+                    continue
+                cost_incl_fee = (o.get("amount", 0) + o.get("commission", 0)) / shares
+                lots.setdefault(code, []).append([shares, cost_incl_fee])
+            elif act == "SELL":
+                shares = o.get("shares", 0)
+                if not shares:
+                    continue
+                net_per_share = (o.get("amount", 0) - o.get("commission", 0)
+                                - o.get("stamp_tax", 0)) / shares
+                q = lots.get(code, [])
+                remaining = shares
+                cost_basis = 0.0
+                while remaining > 0 and q:
+                    lot = q[0]
+                    take = lot[0] if lot[0] <= remaining else remaining
+                    cost_basis += take * lot[1]
+                    lot[0] -= take
+                    remaining -= take
+                    if lot[0] <= 0:
+                        q.pop(0)
+                realized += net_per_share * shares - cost_basis
+        return realized
+
     # ---------- 下单 ----------
     def buy(self, code: str, name: str, price: float, shares: int, reason: str = "") -> dict:
         """买入。shares 必须是 100 的整数倍(A股一手)。返回订单结果"""
@@ -372,13 +411,8 @@ class Simulator:
         orders = self.state["orders"]
         buys = [o for o in orders if o["action"] == "BUY"]
         sells = [o for o in orders if o["action"] == "SELL"]
-        # 已平仓盈亏(简单法: 按卖单)
-        realized = 0.0
-        for s in sells:
-            realized += s["amount"] - s["commission"] - s["stamp_tax"]
-        # 买入成本(含佣金)
-        buy_cost = sum(b["amount"] + b["commission"] for b in buys)
-        realized_pnl = realized - buy_cost
+        # 已平仓盈亏: 用 FIFO 成本基础配对, 正确处理"部分卖出但仍持仓"的双重计算问题
+        realized_pnl = Simulator._realized_pnl_from_orders(orders)
         # 未平仓浮动盈亏
         unrealized = 0.0
         for code, pos in self.state["positions"].items():

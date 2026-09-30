@@ -61,39 +61,52 @@ class TradingLearner:
         """扫描 state.json 的订单, 把新平仓的交易加入经验库"""
         state = state or self._load_state()
         orders = state.get("orders", [])
-        buys = {}   # code -> 最后一笔买入
-        # 逐笔处理: 买入记录快照, 卖出结算盈亏
+        # FIFO 配对: 买入建批次(含入场价/时间/买入理由), 卖出按先买先卖消耗批次。
+        # 部分卖出会拆成多笔平仓记录; 置信度取自"买入"理由(决策时刻的置信度)。
+        lots = {}   # code -> [[剩余股数, 入场价, 入场时间, 买入理由]]
+        closed = []
         for o in orders:
             code = o.get("code")
             if o.get("action") == "BUY":
-                buys[code] = o
-            elif o.get("action") == "SELL" and code in buys:
-                buy = buys.pop(code)
-                # 计算该笔交易盈亏
-                pnl = self._calc_pnl(buy, o)
-                # 从买入时的 reason 提取置信度
-                conf = self._extract_confidence(buy.get("reason", ""))
-                # 持仓分钟数
-                hold_minutes = self._hold_minutes(buy.get("time", ""), o.get("time", ""))
-                trade = {
-                    "code": code,
-                    "name": o.get("name", buy.get("name", code)),
-                    "entry_time": buy.get("time", ""),
-                    "exit_time": o.get("time", ""),
-                    "entry_price": buy.get("price", 0),
-                    "exit_price": o.get("price", 0),
-                    "pnl_pct": round(pnl, 2),
-                    "confidence": conf,
-                    "hold_minutes": hold_minutes,
-                    "reason": buy.get("reason", "")[:100],
-                }
-                self.experience["closed_trades"].append(trade)
+                lots.setdefault(code, []).append([
+                    o.get("shares", 0), o.get("price", 0),
+                    o.get("time", ""), o.get("reason", ""),
+                ])
+            elif o.get("action") == "SELL" and code in lots and lots[code]:
+                q = lots[code]
+                remaining = o.get("shares", 0)
+                exit_price = o.get("price", 0)
+                net_total = o.get("amount", 0) - o.get("commission", 0) - o.get("stamp_tax", 0)
+                net_per_share = net_total / o.get("shares", 1) if o.get("shares") else 0
+                while remaining > 0 and q:
+                    lot = q[0]
+                    take = lot[0] if lot[0] <= remaining else remaining
+                    entry_price, entry_time, entry_reason = lot[1], lot[2], lot[3]
+                    pnl_pct = (net_per_share - entry_price) / entry_price * 100 if entry_price else 0
+                    conf = self._extract_confidence(entry_reason)
+                    hold_minutes = self._hold_minutes(entry_time, o.get("time", ""))
+                    closed.append({
+                        "code": code,
+                        "name": o.get("name", code),
+                        "entry_time": entry_time,
+                        "exit_time": o.get("time", ""),
+                        "entry_price": entry_price,
+                        "exit_price": exit_price,
+                        "pnl_pct": round(pnl_pct, 2),
+                        "confidence": conf,
+                        "hold_minutes": round(hold_minutes, 1),
+                        "reason": entry_reason[:100],
+                    })
+                    lot[0] -= take
+                    remaining -= take
+                    if lot[0] <= 0:
+                        q.pop(0)
 
-        # 去重: 按 entry_time+code 去重(防止重复学习)
+        # 去重: 按 code+入场时间+出场时间 去重(防止重复学习; 部分卖出多笔同出场时间自动合并)
         seen = set()
         unique = []
-        for t in self.experience["closed_trades"]:
-            key = (t.get("code"), t.get("entry_time"))
+        for t in closed:
+            key = (t.get("code"), t.get("entry_time"), t.get("exit_time"))
             if key not in seen:
                 seen.add(key)
                 unique.append(t)
