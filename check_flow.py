@@ -1,38 +1,69 @@
 # -*- coding: utf-8 -*-
-import json, urllib.request, gzip, os
+"""Langflow flow 连通性 / 契约检查（只读）。
 
-BASE = "http://127.0.0.1:7860"
-FLOW_ID = "c25e4d72-5593-48fe-945e-5e3bdde16220"
+旧版会把本地 flow（含真实 DeepSeek api_key）直接覆盖到受版本控制的
+flow_current.json，容易泄露密钥。v2 默认只读；需要导出时写到
+flow_current.local.json（.gitignore 已忽略）并脱敏 api_key。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+from ai_signal import AIAnalyzer
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOCAL_FLOW = os.path.join(BASE_DIR, "flow_current.local.json")
+PLACEHOLDER = "sk-REPLACE_WITH_YOUR_DEEPSEEK_API_KEY"
 
-def fetch(url, token=None, method="GET", body=None):
-    r = urllib.request.Request(BASE + url, method=method)
-    if token:
-        r.add_header("Authorization", "Bearer " + token)
-    r.add_header("Accept-Encoding", "identity")
-    r.add_header("Content-Type", "application/json")
-    data = json.dumps(body).encode() if body is not None else None
-    resp = urllib.request.urlopen(r, data=data, timeout=30)
-    raw = resp.read()
-    if resp.headers.get("Content-Encoding") == "gzip":
-        raw = gzip.decompress(raw)
-    return raw
 
-token = json.loads(fetch("/api/v1/auto_login"))["access_token"]
-raw = fetch(f"/api/v1/flows/{FLOW_ID}", token)
-data = json.loads(raw)
-with open(os.path.join(BASE_DIR, "flow_current.json"), "w", encoding="utf-8") as f:
-    json.dump(data, f, ensure_ascii=False, indent=2)
+def sanitize(node):
+    if isinstance(node, dict):
+        result = {}
+        for key, value in node.items():
+            if key == "api_key" and isinstance(value, dict):
+                value = dict(value)
+                value["value"] = PLACEHOLDER
+            elif key == "api_key" and isinstance(value, str):
+                value = PLACEHOLDER
+            else:
+                value = sanitize(value)
+            result[key] = value
+        return result
+    if isinstance(node, list):
+        return [sanitize(item) for item in node]
+    return node
 
-print("流程名:", data.get("name"))
-for n in data["data"]["nodes"]:
-    nid = n.get("id", "")
-    nd = n.get("data", {})
-    if nid in ("TextInput-5pgMC", "MarketData-aF2Ci", "Prompt-GO1Cu"):
-        tpl = nd.get("node", {}).get("template", {})
-        print(f"\n--- {nid} ({nd.get('node',{}).get('display_name','')}) ---")
-        for k, v in tpl.items():
-            if isinstance(v, dict) and k != "code":
-                print(f"  {k} = {v.get('value', '')!r}")
-            elif isinstance(v, dict) and k == "code":
-                print(f"  code = {len(v.get('value',''))} chars")
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="检查 Langflow flow 契约（不会覆盖仓库里的 flow_current.json）")
+    parser.add_argument("--base", default="http://127.0.0.1:7860")
+    parser.add_argument("--flow", default="")
+    parser.add_argument("--write-local", action="store_true",
+                        help="导出脱敏后的 flow 到 flow_current.local.json")
+    args = parser.parse_args(argv)
+
+    analyzer = AIAnalyzer(base=args.base, flow_id=args.flow or None)
+    contract = analyzer.check_flow_contract()
+    print("flow 契约检查:")
+    for key in ("ok", "has_as_of", "json_mode", "has_symbol_prompt"):
+        print(f"  {key}: {contract.get(key)}")
+    for error in contract.get("errors", []):
+        print(f"  ✗ {error}")
+    if not contract.get("ok"):
+        print("提示: 运行 flow_patch/apply_flow_patch.py 可恢复优化版 flow。")
+
+    if args.write_local:
+        token = analyzer._get_token()  # noqa: SLF001 - 运维脚本，复用认证逻辑
+        raw = analyzer._fetch(f"/api/v1/flows/{analyzer.flow_id}", token, timeout=30)  # noqa: SLF001
+        flow = sanitize(json.loads(raw))
+        with open(LOCAL_FLOW, "w", encoding="utf-8") as fh:
+            json.dump(flow, fh, ensure_ascii=False, indent=2)
+        print(f"已写入脱敏 flow: {LOCAL_FLOW}（已在 .gitignore 中）")
+    return 0 if contract.get("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

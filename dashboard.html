@@ -94,15 +94,15 @@ td.empty, td .empty { text-align:center; color:#999; }
 </div>
 
 <div class="panel">
-    <h2>最近 AI 信号 <small>含消息面</small></h2>
+    <h2>最近 AI 信号 <small>含消息面与执行说明</small></h2>
     <table>
-        <tr><th>时间</th><th>股票</th><th>信号</th><th>置信度</th><th>状态</th></tr>
-        <tbody id="signal-body"><tr><td colspan="5" class="empty">加载中...</td></tr></tbody>
+        <tr><th>时间</th><th>股票</th><th>信号</th><th>置信度</th><th>状态</th><th>说明</th></tr>
+        <tbody id="signal-body"><tr><td colspan="6" class="empty">加载中...</td></tr></tbody>
     </table>
 </div>
 
 <div class="panel">
-    <h2>🧠 AI 学习进度 <small>从已平仓交易中提炼经验, 越跑越聪明</small></h2>
+    <h2>🧠 交易统计 <small>历史已平仓样本，样本不足时仅供参考</small></h2>
     <div class="grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:14px">
         <div class="card">
             <div class="label">已平仓交易</div>
@@ -123,7 +123,7 @@ td.empty, td .empty { text-align:center; color:#999; }
     </div>
     <div id="exp-detail" style="color:#8b95a7;font-size:13px;line-height:1.8">暂无交易经验, 完成几笔交易后自动生成</div>
     <div style="margin-top:10px;color:#8b95a7;font-size:12px;border-top:1px solid #2a3550;padding-top:10px">
-        💰 成本控制: 累计 AI 调用 <b id="usage-calls" style="color:#c9d1e0">0</b> 次 · 规则预筛免费跳过 <b id="usage-skipped" style="color:#c9d1e0">0</b> 只(技术规则打分, 零成本)
+        💰 成本控制: 累计 AI 调用 <b id="usage-calls" style="color:#c9d1e0">0</b> 次 · 失败 <b id="usage-errors" style="color:#c9d1e0">0</b> 次 · 规则预筛跳过 <b id="usage-skipped" style="color:#c9d1e0">0</b> 只 · 估算费用 <b id="usage-cost" style="color:#c9d1e0">¥0</b>
     </div>
 </div>
 
@@ -189,6 +189,12 @@ function renderCards(state) {
     $('val-mv').textContent = '¥' + fmt(mv, 0);
     $('val-pos-count').textContent = Object.keys(state.positions || {}).length;
     $('val-orders').textContent = (state.orders || []).length;
+    const lastScan = state.last_scan || {};
+    if (lastScan.time) {
+        $('last-scan').textContent = '扫描 ' + String(lastScan.time).slice(11, 19)
+            + ' · 买' + (lastScan.buy || 0) + ' 卖' + (lastScan.sell || 0)
+            + ' 跳过' + ((lastScan.skipped || []).length) + ' 错误' + (lastScan.error || 0);
+    }
 }
 
 // ---------- 净值曲线(纯Canvas, 零依赖) ----------
@@ -250,7 +256,8 @@ function redrawChart() {
     ctx.textAlign = 'center';
     const step = Math.max(1, Math.floor(dates.length / 6));
     for (let i = 0; i < dates.length; i += step) {
-        ctx.fillText(String(dates[i]).slice(5), px(i), H - 8);
+        const label = String(dates[i]);
+        ctx.fillText(label === '初始' ? '初始' : label.slice(5), px(i), H - 8);
     }
     // 折线 + 面积
     ctx.beginPath();
@@ -270,7 +277,7 @@ function redrawChart() {
 function updateChart(state) {
     const init = state.initial_capital || 0;
     const nvs = state.daily_net_values || [];
-    const today = new Date().toISOString().slice(0, 10);
+    const today = new Date().toLocaleDateString('sv-SE'); // 本地时区 YYYY-MM-DD
     const dates = [], assets = [];
     for (const nv of nvs) { dates.push(nv.date); assets.push(nv.total_assets); }
     const total = (state.cash || 0) + marketValue(state);
@@ -333,7 +340,7 @@ function renderSignals(state) {
     const tbody = $('signal-body');
     const signals = state.signal_log || [];
     if (!signals.length) {
-        tbody.innerHTML = '<tr><td colspan="5" class="empty">暂无信号</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="6" class="empty">暂无信号</td></tr>';
         return;
     }
     const colorMap = { buy: '#f5222d', sell: '#52c41a', wait: '#faad14', hold: '#faad14', error: '#f5222d' };
@@ -341,14 +348,16 @@ function renderSignals(state) {
     for (const s of signals.slice(-10).reverse()) {
         const sig = s.signal || '';
         const color = colorMap[sig] || '#999';
-        const label = { buy: '买入', sell: '卖出', wait: '观望', hold: '持有', error: '错误' }[sig] || sig;
+        const label = { buy: '买入', sell: '卖出', wait: '观望', hold: '持有', error: '错误' }[sig] || esc(sig);
         const conf = (s.confidence == null) ? '--' : (Number(s.confidence) * 100).toFixed(0) + '%';
         const hallu = s.hallucination_risk ? '<span style="color:#ff4d4f;font-weight:bold">⚠幻觉</span>' : '<span style="color:#8b95a7">正常</span>';
+        const note = s.skip_reason ? ('跳过: ' + s.skip_reason) : (s.reason || '');
         html += '<tr><td>' + esc(String(s.time || '').slice(0, 16)) + '</td>'
               + '<td>' + esc(s.name || '') + '<br><small>' + esc(s.code || '') + '</small></td>'
               + '<td style="color:' + color + ';font-weight:bold">' + label + '</td>'
               + '<td>' + conf + '</td>'
-              + '<td>' + hallu + ' / ' + (s.executed ? '<span style="color:#52c41a">已执行</span>' : '<span style="color:#faad14">未执行</span>') + '</td></tr>';
+              + '<td>' + hallu + ' / ' + (s.executed ? '<span style="color:#52c41a">已执行</span>' : '<span style="color:#faad14">未执行</span>') + '</td>'
+              + '<td><small>' + esc(note.slice(0, 120)) + '</small></td></tr>';
     }
     tbody.innerHTML = html;
 }
@@ -374,19 +383,21 @@ function renderExperience(exp) {
         const cs = st.confidence_stats || {};
         const parts = [];
         for (const k in cs) {
-            parts.push(k + ' ' + cs[k].count + '笔 胜率' + cs[k].win_rate + '% 均收益' + (cs[k].avg_pnl >= 0 ? '+' : '') + cs[k].avg_pnl + '%');
+            parts.push(esc(k) + ' ' + cs[k].count + '笔 胜率' + cs[k].win_rate + '% 均收益' + (cs[k].avg_pnl >= 0 ? '+' : '') + cs[k].avg_pnl + '%');
         }
         detail += parts.join(' | ') || '暂无';
         if (st.recent && st.recent.length) {
             detail += '<br><b>最近平仓:</b> ';
-            detail += st.recent.map(r => r.name + '(' + r.code + ') ' + (r.pnl_pct >= 0 ? '+' : '') + r.pnl_pct + '%').join(' | ');
+            detail += st.recent.map(r => esc(r.name) + '(' + esc(r.code) + ') ' + (r.pnl_pct >= 0 ? '+' : '') + r.pnl_pct + '%').join(' | ');
         }
         $('exp-detail').innerHTML = detail;
     }
     // 成本统计(state.ai_usage)
-    const usage = (window._state && window._state.ai_usage) || { calls: 0, rule_skipped: 0 };
+    const usage = (window._state && window._state.ai_usage) || { calls: 0, errors: 0, rule_skipped: 0, cost_cny: 0 };
     $('usage-calls').textContent = usage.calls || 0;
+    $('usage-errors').textContent = usage.errors || 0;
     $('usage-skipped').textContent = usage.rule_skipped || 0;
+    $('usage-cost').textContent = '¥' + Number(usage.cost_cny || 0).toFixed(2);
 }
 
 // ---------- 主渲染 ----------
@@ -401,7 +412,7 @@ function render(data) {
         $('val-pos-count').textContent = '--';
         $('pos-body').innerHTML = '<tr><td colspan="5" class="empty">暂无模拟盘数据，请先启动交易机器人</td></tr>';
         $('order-body').innerHTML = '<tr><td colspan="6" class="empty">暂无交易</td></tr>';
-        $('signal-body').innerHTML = '<tr><td colspan="5" class="empty">暂无信号</td></tr>';
+        $('signal-body').innerHTML = '<tr><td colspan="6" class="empty">暂无信号</td></tr>';
         return;
     }
     renderCards(state);
@@ -413,9 +424,14 @@ function render(data) {
 }
 
 // ---------- 轮询 ----------
+let refreshing = false;
 async function refresh() {
+    if (refreshing) return;
+    refreshing = true;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
     try {
-        const res = await fetch('/api/state', { cache: 'no-store' });
+        const res = await fetch('/api/state', { cache: 'no-store', signal: controller.signal });
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
         if (!data.ok || !data.state) throw new Error('no data');
@@ -424,6 +440,8 @@ async function refresh() {
     } catch (e) {
         $('err').style.display = 'block';
     } finally {
+        clearTimeout(timer);
+        refreshing = false;
         $('last-refresh').textContent = new Date().toLocaleTimeString('zh-CN', { hour12: false });
     }
 }

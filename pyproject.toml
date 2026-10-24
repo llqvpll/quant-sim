@@ -1,0 +1,21 @@
+[project]
+name = "quant-sim"
+version = "0.2.0"
+description = "A-share AI paper-trading simulator (Langflow + DeepSeek)"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["error::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E9", "F"]

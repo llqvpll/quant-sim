@@ -115,12 +115,12 @@ class MarketDataComponent(Component):
         s = s.replace("SH", "").replace("SZ", "").replace("BJ", "").strip()
         if not s.isdigit() or len(s) != 6:
             return None, f"股票代码格式不正确：{symbol}。请输入6位数字，如 600519 或 000001。"
+        if s.startswith(("920", "4", "8")):
+            return "bj" + s, None
         if s.startswith(("6", "9")):
             return "sh" + s, None
         if s.startswith(("0", "3")):
             return "sz" + s, None
-        if s.startswith(("4", "8")):
-            return "bj" + s, None
         return None, f"无法识别的股票代码前缀：{symbol}"
 
     @staticmethod
@@ -139,16 +139,31 @@ class MarketDataComponent(Component):
         return (9 * 60 + 30) <= minutes <= (11 * 60 + 30) or (13 * 60) <= minutes <= (15 * 60)
 
     @staticmethod
+    def _session_progress(now=None) -> float:
+        """交易时段已走比例，用于盘中量比折算。"""
+        now = now or datetime.now()
+        if now.weekday() >= 5:
+            return 1.0
+        minutes = now.hour * 60 + now.minute + now.second / 60
+        if minutes < 9 * 60 + 30:
+            return 0.01
+        if minutes <= 11 * 60 + 30:
+            return max(0.01, min((minutes - 9 * 60 - 30) / 240.0, 1.0))
+        if minutes < 13 * 60:
+            return 0.5
+        if minutes <= 15 * 60:
+            return max(0.01, min((120 + minutes - 13 * 60) / 240.0, 1.0))
+        return 1.0
+
+    @staticmethod
     def _limit_ratio(code6: str, name: str = "") -> float:
         """按板块推断涨跌停幅度。"""
+        if code6.startswith(("4", "8", "920")):
+            return 0.30
+        if code6.startswith(("300", "301", "302", "688", "689")):
+            return 0.20
         if name and "ST" in str(name).upper():
             return 0.05
-        if code6.startswith(("300", "301", "302")):
-            return 0.20
-        if code6.startswith(("688", "689")):
-            return 0.20
-        if code6.startswith(("4", "8")):
-            return 0.30
         return 0.10
 
     # ---------- 网络 ----------
@@ -168,10 +183,10 @@ class MarketDataComponent(Component):
                 time.sleep(0.5 * (attempt + 1))
         raise RuntimeError(f"{url} 请求失败: {type(last_exc).__name__}: {last_exc}")
 
-    def _fetch_tencent(self, tencent_code: str, period: str, limit: int):
+    def _fetch_tencent(self, tencent_code: str, period: str, limit: int, as_of: str = ""):
         payload = self._get(
             TENCENT_KLINE_URL,
-            params={"param": f"{tencent_code},{period},,,{limit},qfq"},
+            params={"param": f"{tencent_code},{period},,{as_of},{limit},qfq"},
         ).json()
         if payload.get("code") != 0:
             raise RuntimeError(f"腾讯K线接口返回错误: {payload.get('msg') or payload.get('code')}")
@@ -192,6 +207,8 @@ class MarketDataComponent(Component):
                     "volume": float(line[5]),
                 }
             )
+        if as_of:
+            rows = [row for row in rows if row["time"] <= as_of]
         return rows
 
     def _fetch_sina(self, tencent_code: str, limit: int):
@@ -216,22 +233,24 @@ class MarketDataComponent(Component):
             )
         return rows
 
-    def _fetch_kline(self, tencent_code: str, period: str, limit: int):
-        """腾讯优先，失败自动切新浪(仅日线)。"""
-        key = (tencent_code, period, limit)
+    def _fetch_kline(self, tencent_code: str, period: str, limit: int, as_of: str = ""):
+        """腾讯优先，失败自动切新浪(仅日线)。as_of 时腾讯按截止日取数。"""
+        key = (tencent_code, period, limit, as_of)
         now = time.time()
         hit = _KLINE_CACHE.get(key)
         if hit and now - hit[0] < KLINE_TTL:
             return hit[1], hit[2]
         try:
-            rows = self._fetch_tencent(tencent_code, period, limit)
+            rows = self._fetch_tencent(tencent_code, period, limit, as_of)
             source = "腾讯财经(前复权)"
         except Exception as exc:  # noqa: BLE001
             errors = [f"腾讯: {exc}"]
             if period != "day":
                 raise RuntimeError("；".join(errors)) from exc
             try:
-                rows = self._fetch_sina(tencent_code, limit)
+                rows = self._fetch_sina(tencent_code, limit + 120 if as_of else limit)
+                if as_of:
+                    rows = [row for row in rows if row["time"] <= as_of][-limit:]
                 source = "新浪财经(不复权)"
             except Exception as exc2:  # noqa: BLE001
                 errors.append(f"新浪: {exc2}")
@@ -362,7 +381,7 @@ class MarketDataComponent(Component):
                 raise ValueError(err)
             period = "day" if interval == "1d" else "week"
             try:
-                rows, source = self._fetch_kline(tencent_code, period, limit)
+                rows, source = self._fetch_kline(tencent_code, period, limit, as_of)
             except Exception as exc:  # noqa: BLE001
                 raise ValueError(f"行情获取失败（腾讯/新浪都不可用，已终止分析，避免让模型凭空猜测）：{exc}") from exc
 
@@ -457,6 +476,11 @@ class MarketDataComponent(Component):
             arrange = "均线数据不足60根"
 
         vol_ratio_kline = volumes[-1] / max(sum(volumes[-6:-1]) / 5, 1e-9) if len(volumes) >= 6 else None
+        if vol_ratio_kline is not None and not as_of and last_date == today:
+            # 盘中最后一根 K 线成交量不完整，按已走交易时段折算
+            progress = self._session_progress()
+            if 0 < progress < 1:
+                vol_ratio_kline = vol_ratio_kline / max(progress, 0.05)
 
         def fmt(v, digits=2):
             return "None" if v is None else f"{v:.{digits}f}"
@@ -508,7 +532,7 @@ class MarketDataComponent(Component):
                 f"回测模式：未使用实时数据。按 ±{ratio * 100:.0f}% 估算：下一交易日涨停约 {last * (1 + ratio):.2f}，跌停约 {last * (1 - ratio):.2f}"
             )
 
-        lines.append(f"最近K线（日期 开 高 低 收 量，单位手）：")
+        lines.append("最近K线（日期 开 高 低 收 量，单位手）：")
         for r in rows[-6:]:
             lines.append(
                 f"  {r['time']}  O{r['open']:.2f} H{r['high']:.2f} L{r['low']:.2f} "

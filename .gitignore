@@ -8,11 +8,20 @@ data/
 *.log
 bot.lock*
 
+# Langflow 本地导出（可能含 API Key，禁止提交）
+flow_current.local.json
+
 # 本地备份
 *.bak_*
 flow_backup_*.json
 *_backup_*.json
 *_bak_*.json
+
+# 测试/构建缓存
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
 
 # 环境变量与密钥
 .env
