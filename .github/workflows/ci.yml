@@ -22,4 +22,4 @@ jobs:
       - name: Compile
         run: python -m compileall -q .
       - name: Test
-        run: pytest
+        run: python -m pytest

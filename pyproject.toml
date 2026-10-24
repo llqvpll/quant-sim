@@ -10,6 +10,7 @@ dev = ["pytest>=8.0", "ruff>=0.6"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 addopts = "-q"
 filterwarnings = ["error::DeprecationWarning"]
 
