@@ -29,6 +29,10 @@ quant-sim summary          # 打印成绩单
 
 ## 快速开始
 
+**不想自己编译**：直接下 Windows 版 [最新发布](https://github.com/llqvpll/quant-sim/releases/latest)，
+把 `quant-sim.exe` 与 `dashboard.html` 放在同一目录即可运行，不需要装 Rust，也没有任何运行时依赖。
+首次启动会在 exe 同级创建 `data/`；想放到别处就设 `QUANT_SIM_HOME`。
+
 ### 1. 构建
 
 需要 Rust 1.75+。Linux 下 `native-tls` 依赖 OpenSSL 开发包。
