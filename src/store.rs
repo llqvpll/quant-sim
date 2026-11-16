@@ -104,6 +104,16 @@ impl Paths {
         self.data_dir().join("backtest_walk.json")
     }
 
+    /// 因子评估报告。
+    pub fn factor_report(&self) -> PathBuf {
+        self.data_dir().join("factor_report.json")
+    }
+
+    /// 规则因子面板（JSONL，一行一个标的日期样本）。
+    pub fn factor_panel(&self) -> PathBuf {
+        self.data_dir().join("factor_panel.jsonl")
+    }
+
     pub fn snapshots_dir(&self) -> PathBuf {
         self.data_dir().join("snapshots")
     }

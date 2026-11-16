@@ -92,8 +92,10 @@ quant-sim backtest --symbol 600000 --days 60
 | `snapshot create --symbols A,B [--days N]` | 抓取并落盘一份行情快照 |
 | `snapshot list` | 列出已有快照的 id、创建时间与标的数 |
 | `backtest --walk N` | 把区间切成 N 个连续窗口分别回测，做样本外稳健性检验 |
+| `factor build` | 用快照 K 线算技术规则因子面板，不调用模型 |
+| `factor report` | 算因子 IC、ICIR、正 IC 比例与分层收益 |
 
-`summary`、`dashboard`、`reset` 不需要 API Key；`backtest --replay`、`backtest --snapshot`、`backtest --walk --replay` 也不需要。
+`summary`、`dashboard`、`reset` 不需要 API Key；`backtest --replay`、`backtest --snapshot`、`backtest --walk --replay`、`factor build`、`factor report` 也不需要。
 
 ## 回测结果与可复现性
 
@@ -161,6 +163,33 @@ quant-sim backtest --snapshot latest --symbol 600000 --days 60 --walk 3 --replay
 
 **这个功能的准确名字是「滚动样本外稳健性检验」，不是 walk-forward optimization**：系统没有任何可训练参数，不做参数寻优，也不划分训练/验证/测试三段，因此每个窗口天然都是样本外。它只回答「同一套规则在不同行情段里表现是否一致」，不回答「哪组参数更好」，也不给投资建议。
 
+## 因子评估：IC 与 ICIR
+
+「买/卖/观望」这种离散标签没法做统计检验——没人知道它到底有没有预测力。标准做法是把信号当成**因子**：连续打分，再和未来收益算相关系数（IC），看 IC 均值与 ICIR 是否稳定为正。
+
+```bash
+# 1) 用快照里的真实 K 线算技术规则因子面板（不调用大模型）
+quant-sim factor build --snapshot latest --horizon 5 --days 150
+
+# 2) 评估：横截面 IC 序列、ICIR、正 IC 比例、三层分层收益
+quant-sim factor report --snapshot latest --panel data/factor_panel.jsonl --horizon 5
+```
+
+`factor report` 也可以直接读 `data/backtest_signals.jsonl`（回测产出的模型信号日志），把大模型的输出当因子评估，此时分数按 `buy = +置信度 / sell = -置信度 / 其余 = 0` 折算。
+
+计算口径：按交易日分组，组内标的数 ≥3 才计算一次 Pearson 相关系数（两点样本的相关系数恒为 ±1，没有意义），得到 IC 序列；`ic_std` 用总体标准差，`icir = ic_mean / ic_std`；分层是把所有样本按因子值升序切成三层，比较各层的平均前向收益。
+
+报告里的 `sufficient` 只有在「有效 IC ≥20 期且平均横截面 ≥5 只」时才为 `true`，否则会写明实际值并标注「统计意义有限」。这个门槛不为了让报告好看而放宽。
+
+**一个真实结果**（6 只标的、145 个交易日、前向 5 日）：
+
+```
+IC 均值 -0.073 | 标准差 0.551 | ICIR -0.133 | 正 IC 43.5%
+分层：低 0.22% | 中 0.01% | 高 -0.22%
+```
+
+IC 为负、分层单调反向，说明在这批样本上技术规则分**没有正向预测力**。这是如实结果：IC 标准差 0.55 远大于均值 0.073，ICIR 绝对值仅 0.13，本来就落在噪声量级；样本只有 6 只标的，也只能说明这批样本，不能外推成「技术指标无效」。评估工具的价值在于能证伪，不在于给出好看的数。
+
 ## 数据源
 
 | 用途 | 来源 | 备忘 |
@@ -227,6 +256,7 @@ quant-sim/
 │   ├── sizing.rs         仓位计算的唯一入口（实盘与回测共用）
 │   ├── snapshot.rs       行情快照的落盘与离线读取
 │   ├── walk.rs           滚动窗口切分与汇总统计
+│   ├── factor.rs         因子打分、IC/ICIR 与分层收益
 │   ├── indicators.rs     MA/RSI/MACD/ATR/量比与规则打分
 │   ├── rules.rs          板块、涨跌停、交易单位、T+1
 │   ├── market.rs         行情与 K 线
@@ -249,6 +279,7 @@ quant-sim/
 - 没有逐笔与盘口撮合，无法模拟排队、部分成交和冲击成本；回测用开盘价加滑点近似。
 - 未处理除权除息，长周期持有跨越除权日会失真；回测用前复权 K 线，实盘模拟用原始报价。
 - 新闻只做标题相关性与关键词情感，不是完整舆情分析。
+- 因子 IC 的样本量受快照股票池限制。只有 6 只标的时，ICIR 的量级（0.1 左右）与噪声难以区分，只能说明「这批样本上看不出预测力」，不能外推成「该因子无效」。要得到可靠结论需要 30 只以上的股票池与更长的区间。
 - 正常回测依赖模型输出，同样行情可能给出不同信号；需要可复现的结果请用 `--replay` 重放信号日志（见「回测结果与可复现性」）。
 - 不加 `--snapshot` 时 K 线是实时拉取的，行情源每多一根新 K 线，相同 `--days` 的回测区间就会右移一天；跨版本结果对比必须先固定行情快照。
 - 加载 K 线时取 `--days + 120` 根，因此改 `--days` 可能让回测起点偏移一天（例如 60 天取 180 根、150 天取 270 根）。`--walk` 且不传 `--days` 时是例外：会加载快照全部 K 线（上限 640 根），起点比默认单段早一天。跨版本比较要固定同一 `--days` 与同一快照，不要拿不同 `--days` 的结果逐日对比。

@@ -10,6 +10,7 @@ mod calendar;
 mod config;
 mod dashboard;
 mod error;
+mod factor;
 mod http;
 mod indicators;
 mod learner;
@@ -26,6 +27,7 @@ mod types;
 mod util;
 mod walk;
 
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -134,6 +136,11 @@ enum Cmd {
         #[command(subcommand)]
         action: SnapshotCmd,
     },
+    /// 因子评估旁路：离散信号折成连续分数，与未来收益做 IC 检验
+    Factor {
+        #[command(subcommand)]
+        action: FactorCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -152,6 +159,40 @@ enum SnapshotCmd {
     },
     /// 列出已有快照
     List,
+}
+
+#[derive(Subcommand)]
+enum FactorCmd {
+    /// 读信号日志与快照，输出 IC/ICIR 与分层收益
+    Report {
+        /// 快照 id，默认用最新一份
+        #[arg(long, default_value = "latest")]
+        snapshot: String,
+        /// 前向收益期数（交易日）
+        #[arg(long, default_value_t = 5)]
+        horizon: usize,
+        /// 信号日志路径；不传则用 data/backtest_signals.jsonl
+        #[arg(long, default_value = "")]
+        panel: String,
+    },
+    /// 从快照算技术规则因子面板（不调用模型）
+    Build {
+        /// 快照 id，默认用最新一份
+        #[arg(long, default_value = "latest")]
+        snapshot: String,
+        /// 逗号分隔的标的代码；不传则用快照里全部有日 K 的标的
+        #[arg(long, default_value = "")]
+        symbols: String,
+        /// 前向收益期数（交易日）
+        #[arg(long, default_value_t = 5)]
+        horizon: usize,
+        /// 参与计算的最大交易日数；0 表示用满快照可用区间
+        #[arg(long, default_value_t = 150)]
+        days: usize,
+        /// 面板输出路径；不传则用 data/factor_panel.jsonl
+        #[arg(long, default_value = "")]
+        out: String,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -214,6 +255,20 @@ fn dispatch(cli: Cli) -> AppResult<()> {
                 benchmark,
             } => cmd_snapshot_create(&symbols, days, &benchmark),
             SnapshotCmd::List => cmd_snapshot_list(),
+        },
+        Cmd::Factor { action } => match action {
+            FactorCmd::Report {
+                snapshot,
+                horizon,
+                panel,
+            } => cmd_factor_report(&snapshot, horizon, &panel),
+            FactorCmd::Build {
+                snapshot,
+                symbols,
+                horizon,
+                days,
+                out,
+            } => cmd_factor_build(&snapshot, &symbols, horizon, days, &out),
         },
     }
 }
@@ -456,6 +511,115 @@ fn cmd_snapshot_list() -> AppResult<()> {
     Ok(())
 }
 
+/// 从快照算技术规则因子面板；只读磁盘日 K，不构造模型客户端。
+fn cmd_factor_build(
+    snapshot: &str,
+    symbols: &str,
+    horizon: usize,
+    days: usize,
+    out: &str,
+) -> AppResult<()> {
+    let paths = Paths::resolve();
+    let snapshot_id = snapshot::resolve_id(&paths, snapshot)?;
+    if !paths.snapshot_dir(&snapshot_id).exists() {
+        return Err(AppError::Business(format!("快照 {snapshot_id} 不存在")));
+    }
+    let mut list = parse_symbols("", symbols);
+    if list.is_empty() {
+        // 不指定标的时用快照里真正抓过日 K 的全部标的
+        list = snapshot::read_meta(&paths, &snapshot_id)?.kline_symbols;
+    }
+    if list.is_empty() {
+        return Err(AppError::Invalid(
+            "快照里没有可用的日K标的，请用 --symbols 指定".to_string(),
+        ));
+    }
+    let (rows, skipped) = factor::build_rule_panel(&paths, &snapshot_id, &list, days, horizon)?;
+    let out_path = if out.trim().is_empty() {
+        paths.factor_panel()
+    } else {
+        PathBuf::from(out.trim())
+    };
+    factor::save_panel(&out_path, &rows)?;
+
+    let span = if days == 0 {
+        "全部".to_string()
+    } else {
+        days.to_string()
+    };
+    log(&format!(
+        "[因子] 规则因子面板：{} 只 × {span} 期 → {} 行，跳过 {skipped} 行 | 前向 {} 日",
+        list.len(),
+        rows.len(),
+        horizon
+    ));
+    log(&format!(
+        "[因子] 快照 {snapshot_id} | 面板文件: {}",
+        out_path.display()
+    ));
+    Ok(())
+}
+
+/// 因子评估：只读信号日志与快照，不改动任何决策链路。
+fn cmd_factor_report(snapshot: &str, horizon: usize, panel: &str) -> AppResult<()> {
+    if horizon == 0 {
+        return Err(AppError::Invalid("--horizon 必须为正整数".to_string()));
+    }
+    let paths = Paths::resolve();
+    let snapshot_id = snapshot::resolve_id(&paths, snapshot)?;
+    let snapshot_dir = paths.snapshot_dir(&snapshot_id);
+    if !snapshot_dir.exists() {
+        return Err(AppError::Business(format!("快照 {snapshot_id} 不存在")));
+    }
+    let signals = if panel.trim().is_empty() {
+        paths.backtest_signals()
+    } else {
+        PathBuf::from(panel.trim())
+    };
+
+    let (rows, skipped) = factor::build_panel(&signals, &snapshot_dir, horizon)?;
+    let report = factor::evaluate(&rows, horizon);
+    let report_path = paths.factor_report();
+    factor::save_report(&report_path, &snapshot_id, &report)?;
+
+    log(&format!(
+        "[因子] 样本 {} 行 / {} 期 / 平均每期 {} 只 | 前向 {} 日",
+        report.rows,
+        report.dates,
+        fixed(report.mean_width, 1),
+        report.horizon_days
+    ));
+    log(&format!(
+        "[因子] IC 均值 {} | 标准差 {} | ICIR {} | 正 IC {}%",
+        fixed(report.ic_mean, 3),
+        fixed(report.ic_std, 3),
+        fixed(report.icir, 3),
+        fixed(report.positive_ic_ratio_pct, 1)
+    ));
+    let layer_text: Vec<String> = report
+        .layers
+        .iter()
+        .map(|layer| format!("{} {}%", layer.layer, fixed(layer.mean_forward_pct, 2)))
+        .collect();
+    log(&format!("[因子] 分层：{}", layer_text.join(" | ")));
+    log(&format!("[因子] {}", report.note));
+    if skipped > 0 {
+        log(&format!(
+            "[因子] 跳过 {skipped} 行（快照缺该标的、缺少该日期或前向收益越界）"
+        ));
+    }
+    log(&format!(
+        "[因子] 快照 {snapshot_id} | 报告文件: {}",
+        report_path.display()
+    ));
+    Ok(())
+}
+
+/// 定点小数格式化：先按位四舍五入，避免把接近零的负数渲染成 "-0.000"。
+fn fixed(value: f64, digits: usize) -> String {
+    format!("{:.*}", digits, util::round_to(value, digits as u32))
+}
+
 /// `--symbols "600519,000001"` 优先；没给就用 `--symbol`。
 fn parse_symbols(symbol: &str, symbols: &str) -> Vec<String> {
     let raw = if symbols.trim().is_empty() {
@@ -627,6 +791,59 @@ mod tests {
         );
         assert_eq!(parse_symbols("600519", "   "), vec!["600519".to_string()]);
         assert!(parse_symbols("", " , ").is_empty());
+    }
+
+    #[test]
+    fn factor_report_has_documented_defaults() {
+        let cli = Cli::try_parse_from(["quant-sim", "factor", "report"]).unwrap();
+        match cli.cmd {
+            Cmd::Factor {
+                action:
+                    FactorCmd::Report {
+                        snapshot,
+                        horizon,
+                        panel,
+                    },
+            } => {
+                // 空 panel 表示回落到 data/backtest_signals.jsonl，好让 QUANT_SIM_HOME 生效
+                assert_eq!(snapshot, "latest");
+                assert_eq!(horizon, 5);
+                assert_eq!(panel, "");
+            }
+            _ => panic!("应解析为 factor report 子命令"),
+        }
+        let cli =
+            Cli::try_parse_from(["quant-sim", "factor", "report", "--horizon", "10"]).unwrap();
+        match cli.cmd {
+            Cmd::Factor {
+                action: FactorCmd::Report { horizon, .. },
+            } => assert_eq!(horizon, 10),
+            _ => panic!("应解析为 factor report 子命令"),
+        }
+    }
+
+    #[test]
+    fn factor_build_has_documented_defaults() {
+        let cli = Cli::try_parse_from(["quant-sim", "factor", "build"]).unwrap();
+        match cli.cmd {
+            Cmd::Factor {
+                action:
+                    FactorCmd::Build {
+                        snapshot,
+                        symbols,
+                        horizon,
+                        days,
+                        out,
+                    },
+            } => {
+                assert_eq!(snapshot, "latest");
+                assert_eq!(symbols, "");
+                assert_eq!(horizon, 5);
+                assert_eq!(days, 150);
+                assert_eq!(out, "");
+            }
+            _ => panic!("应解析为 factor build 子命令"),
+        }
     }
 
     #[test]

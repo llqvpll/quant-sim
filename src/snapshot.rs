@@ -224,6 +224,12 @@ pub fn resolve_id(paths: &Paths, id: &str) -> AppResult<String> {
     Ok(latest.id)
 }
 
+/// 只读快照的 meta；因子面板按 `kline_symbols` 决定默认标的。
+pub fn read_meta(paths: &Paths, id: &str) -> AppResult<SnapshotMeta> {
+    let resolved = resolve_id(paths, id)?;
+    read_json(&paths.snapshot_dir(&resolved).join("meta.json"))
+}
+
 /// 列出已有快照，按 id 升序（时间字符串本身可排序）。
 pub fn list(paths: &Paths) -> AppResult<Vec<SnapshotEntry>> {
     let dir = paths.snapshots_dir();
@@ -273,7 +279,8 @@ fn key_of(code: &str) -> String {
         .to_lowercase()
 }
 
-fn file_name(code: &str) -> String {
+/// 单个标的的 K 线文件名；因子面板等只读方复用同一规则，避免各处命名漂移。
+pub(crate) fn file_name(code: &str) -> String {
     format!("{}.json", key_of(code))
 }
 
