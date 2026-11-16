@@ -134,6 +134,11 @@ impl LlmClient {
         LlmClient { http, cfg }
     }
 
+    /// 重放模式专用：不打印模型配置。占位凭据出现在日志里会被误读成真的连了模型。
+    pub fn new_quiet(http: HttpClient, cfg: LlmConfig) -> Self {
+        LlmClient { http, cfg }
+    }
+
     /// 请求体固定带 `response_format=json_object`：我们只要结构化信号，
     /// 不要模型的客套话。
     pub fn build_body(&self, prompt: &str) -> serde_json::Value {

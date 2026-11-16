@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
-use crate::backtest::Backtest;
+use crate::backtest::{Backtest, BacktestSettings};
 use crate::bot::{print_summary, Bot, LockGuard};
 use crate::calendar::Calendar;
 use crate::error::{AppError, AppResult};
@@ -110,6 +110,12 @@ enum Cmd {
         slippage_bps: f64,
         #[arg(long, default_value_t = 0.05)]
         max_volume_ratio: f64,
+        /// 基准指数代码；裸 6 位码按上证指数处理，也可显式写 sh000300 / sz399300
+        #[arg(long, default_value = "000300")]
+        benchmark: String,
+        /// 从 data/backtest_signals.jsonl 重放信号，不再调用模型
+        #[arg(long)]
+        replay: bool,
     },
 }
 
@@ -146,16 +152,36 @@ fn dispatch(cli: Cli) -> AppResult<()> {
             capital,
             slippage_bps,
             max_volume_ratio,
-        } => cmd_backtest(
-            &symbol,
-            &symbols,
-            days,
-            decision_every,
-            capital,
-            slippage_bps,
-            max_volume_ratio,
-        ),
+            benchmark,
+            replay,
+        } => {
+            let args = BacktestCliArgs {
+                symbol,
+                symbols,
+                days,
+                decision_every,
+                capital,
+                slippage_bps,
+                max_volume_ratio,
+                benchmark,
+                replay,
+            };
+            cmd_backtest(&args)
+        }
     }
+}
+
+/// 回测子命令的原始输入，与 clap 字段一一对应。
+struct BacktestCliArgs {
+    symbol: String,
+    symbols: String,
+    days: Option<u32>,
+    decision_every: Option<u32>,
+    capital: Option<f64>,
+    slippage_bps: f64,
+    max_volume_ratio: f64,
+    benchmark: String,
+    replay: bool,
 }
 
 fn cmd_run(
@@ -241,16 +267,8 @@ fn cmd_dashboard(host: &str, port: u16) -> AppResult<()> {
     dashboard::serve(&paths, host, port)
 }
 
-fn cmd_backtest(
-    symbol: &str,
-    symbols: &str,
-    days: Option<u32>,
-    decision_every: Option<u32>,
-    capital: Option<f64>,
-    slippage_bps: f64,
-    max_volume_ratio: f64,
-) -> AppResult<()> {
-    if let Some(value) = capital {
+fn cmd_backtest(args: &BacktestCliArgs) -> AppResult<()> {
+    if let Some(value) = args.capital {
         if value <= 0.0 {
             return Err(AppError::Invalid("--capital 必须为正数".to_string()));
         }
@@ -259,33 +277,53 @@ fn cmd_backtest(
     let cal = Rc::new(Calendar::load(&paths));
     // 回测天数与决策频率的默认值来自账户配置，所以先读一次 state。
     let cfg = {
-        let sim = Simulator::open(&paths, capital, Rc::clone(&cal))?;
+        let sim = Simulator::open(&paths, args.capital, Rc::clone(&cal))?;
         sim.cfg().clone()
     };
 
-    let symbol_list = parse_symbols(symbol, symbols);
+    let symbol_list = parse_symbols(&args.symbol, &args.symbols);
     if symbol_list.is_empty() {
         return Err(AppError::Invalid("--symbols 至少要给一个代码".to_string()));
     }
 
-    let llm_cfg = LlmConfig::from_env(&cfg)?;
+    // 重放时模型不会被调用，但仍需一个 AiSource 实例；用占位 Key 构造，避免无 Key 机器上无法复现。
+    let llm_cfg = if args.replay {
+        LlmConfig::resolve(
+            &|name| {
+                if name.ends_with("API_KEY") {
+                    Some("replay-offline".to_string())
+                } else {
+                    None
+                }
+            },
+            &cfg,
+        )
+    } else {
+        LlmConfig::from_env(&cfg)
+    }?;
+    let ai_model = llm_cfg.model.clone();
     let fast = Duration::from_secs(FAST_TIMEOUT_SECS);
     let slow = Duration::from_secs(cfg.ai_timeout_seconds as u64 + SLOW_TIMEOUT_MARGIN_SECS);
-    let ai = LlmClient::new(HttpClient::new(fast, slow)?, llm_cfg);
+    let llm_http = HttpClient::new(fast, slow)?;
+    let ai = if args.replay {
+        LlmClient::new_quiet(llm_http, llm_cfg)
+    } else {
+        LlmClient::new(llm_http, llm_cfg)
+    };
     let mut md = MarketData::new(HttpClient::new(fast, slow)?, Rc::clone(&cal));
 
-    let mut engine = Backtest::new(
-        &mut md,
-        &ai,
-        &paths,
-        Rc::clone(&cal),
+    let mut settings = BacktestSettings::new(
         symbol_list,
-        days.unwrap_or(cfg.backtest_days) as usize,
-        decision_every.unwrap_or(cfg.backtest_decision_every) as usize,
-        capital,
-        slippage_bps,
-        max_volume_ratio,
+        args.days.unwrap_or(cfg.backtest_days) as usize,
+        args.decision_every.unwrap_or(cfg.backtest_decision_every) as usize,
+        args.capital,
+        args.slippage_bps,
+        args.max_volume_ratio,
     );
+    settings.benchmark = args.benchmark.clone();
+    settings.replay = args.replay;
+    settings.ai_model = ai_model;
+    let mut engine = Backtest::new(&mut md, &ai, &paths, Rc::clone(&cal), settings);
     // 回测的头部与结果行（含结果文件路径）由 Backtest::run 自己打印，这里不重复。
     let result = engine.run()?;
     match result.error {
@@ -392,6 +430,8 @@ mod tests {
                 capital,
                 slippage_bps,
                 max_volume_ratio,
+                benchmark,
+                replay,
             } => {
                 assert_eq!(symbol, "600519");
                 assert_eq!(symbols, "");
@@ -400,6 +440,29 @@ mod tests {
                 assert_eq!(capital, None);
                 assert_eq!(slippage_bps, 5.0);
                 assert_eq!(max_volume_ratio, 0.05);
+                assert_eq!(benchmark, "000300");
+                assert!(!replay);
+            }
+            _ => panic!("应解析为 backtest 子命令"),
+        }
+    }
+
+    #[test]
+    fn backtest_accepts_benchmark_and_replay() {
+        let cli = Cli::try_parse_from([
+            "quant-sim",
+            "backtest",
+            "--benchmark",
+            "sz399300",
+            "--replay",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Backtest {
+                benchmark, replay, ..
+            } => {
+                assert_eq!(benchmark, "sz399300");
+                assert!(replay);
             }
             _ => panic!("应解析为 backtest 子命令"),
         }

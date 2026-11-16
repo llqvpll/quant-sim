@@ -91,6 +91,14 @@ impl Paths {
     pub fn backtest_result(&self) -> PathBuf {
         self.data_dir().join("backtest_result.json")
     }
+
+    pub fn backtest_manifest(&self) -> PathBuf {
+        self.data_dir().join("backtest_manifest.json")
+    }
+
+    pub fn backtest_signals(&self) -> PathBuf {
+        self.data_dir().join("backtest_signals.jsonl")
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

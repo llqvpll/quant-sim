@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::error::AppResult;
 use crate::indicators;
 use crate::rules;
-use crate::signal::{AnalyzeRequest, SignalAction};
+use crate::signal::{AnalyzeRequest, GroundOptions, SignalAction};
 use crate::simulator::{BuyRequest, SellRequest, Simulator, Snapshot};
 use crate::store::{self, NetValue, Order, Paths};
 use crate::types::{AiSource, Bar, MarketSource};
@@ -27,6 +27,98 @@ const MIN_DATES: usize = 45;
 const WARMUP_BARS: usize = 30;
 /// 回测区间至少这么多个交易日。
 const MIN_RANGE_DAYS: usize = 10;
+/// 指数至少要有首尾两根才能算区间涨幅。
+const MIN_BENCHMARK_BARS: usize = 2;
+/// 信号日志里模型原文最多保留的字符数（按字符而非字节）。
+const SIGNAL_RAW_MAX_CHARS: usize = 2000;
+/// 改动 prompt 结构时必须同步递增，manifest 靠它区分不可比的结果。
+const PROMPT_VERSION: &str = "v1";
+/// 行情与消息面的数据来源域名，写进 manifest 供结果溯源。
+const DATA_SOURCES: [&str; 3] = [
+    "qt.gtimg.cn",
+    "web.ifzq.gtimg.cn",
+    "search-api-web.eastmoney.com",
+];
+
+/// 回测的全部输入。默认值让单测与 CLI 保持同一份口径。
+#[derive(Clone, Debug)]
+pub struct BacktestSettings {
+    pub symbols: Vec<String>,
+    pub days: usize,
+    pub decision_every: usize,
+    pub capital: Option<f64>,
+    pub slippage_bps: f64,
+    pub max_volume_ratio: f64,
+    pub benchmark: String,
+    pub replay: bool,
+    /// 模型名（绝不含 Key）。replay 时也随 manifest 落盘，便于确认当初用的模型。
+    pub ai_model: String,
+}
+
+impl Default for BacktestSettings {
+    fn default() -> Self {
+        BacktestSettings {
+            symbols: vec!["600519".to_string()],
+            days: 60,
+            decision_every: 5,
+            capital: None,
+            slippage_bps: 5.0,
+            max_volume_ratio: 0.05,
+            benchmark: "000300".to_string(),
+            replay: false,
+            ai_model: String::new(),
+        }
+    }
+}
+
+impl BacktestSettings {
+    /// 一次收齐交易参数，基准/重放/模型名用结构体字段单独设置。
+    pub fn new(
+        symbols: Vec<String>,
+        days: usize,
+        decision_every: usize,
+        capital: Option<f64>,
+        slippage_bps: f64,
+        max_volume_ratio: f64,
+    ) -> Self {
+        BacktestSettings {
+            symbols,
+            days,
+            decision_every,
+            capital,
+            slippage_bps,
+            max_volume_ratio,
+            ..BacktestSettings::default()
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct YearlyReturn {
+    pub year: String,
+    pub return_pct: f64,
+}
+
+/// 每次成功回测的运行指纹，用来判断两份结果是否可比。
+#[derive(Serialize)]
+pub struct BacktestManifest {
+    pub created_at: String,
+    pub app_version: String,
+    pub symbols: Vec<String>,
+    pub benchmark: String,
+    pub benchmark_source: String,
+    pub start: String,
+    pub end: String,
+    pub trading_days: usize,
+    pub initial_capital: f64,
+    pub slippage_bps: f64,
+    pub max_volume_ratio: f64,
+    pub decision_every: usize,
+    pub ai_model: String,
+    pub prompt_version: String,
+    pub data_sources: Vec<String>,
+    pub deterministic: bool,
+}
 
 pub struct PendingOrder {
     pub code: String,
@@ -62,9 +154,17 @@ pub struct BacktestResult {
     pub total_return_pct: f64,
     pub annualized_pct: f64,
     pub benchmark_return_pct: f64,
+    pub benchmark_code: String,
+    pub benchmark_source: String,
     pub excess_return_pct: f64,
     pub max_drawdown_pct: f64,
     pub sharpe: f64,
+    pub sortino: f64,
+    pub calmar: f64,
+    pub information_ratio: f64,
+    pub max_consecutive_loss_days: usize,
+    pub turnover_pct: f64,
+    pub yearly_returns: Vec<YearlyReturn>,
     pub ai_calls: u64,
     pub ai_errors: u64,
     pub slippage_bps: f64,
@@ -91,6 +191,12 @@ pub struct Backtest<'a, M: MarketSource, A: AiSource> {
     max_volume_ratio: f64,
     bars: HashMap<String, HashMap<String, Bar>>,
     prev_close: HashMap<String, HashMap<String, f64>>,
+    /// 基准指数单独存放，绝不并入 dates（否则会改变回测起点）。
+    benchmark_bars: BTreeMap<String, Bar>,
+    benchmark_code: String,
+    benchmark_source: String,
+    settings: BacktestSettings,
+    replay_raw: HashMap<(String, String), String>,
     dates: Vec<String>,
     pending: Vec<PendingOrder>,
     trades: Vec<BacktestTrade>,
@@ -103,33 +209,34 @@ pub struct Backtest<'a, M: MarketSource, A: AiSource> {
 }
 
 impl<'a, M: MarketSource, A: AiSource> Backtest<'a, M, A> {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         md: &'a mut M,
         ai: &'a A,
         paths: &'a Paths,
         cal: Rc<Calendar>,
-        symbols: Vec<String>,
-        days: usize,
-        decision_every: usize,
-        capital: Option<f64>,
-        slippage_bps: f64,
-        max_volume_ratio: f64,
+        mut settings: BacktestSettings,
     ) -> Self {
-        let symbols: Vec<String> = symbols
-            .into_iter()
+        settings.symbols = settings
+            .symbols
+            .iter()
             .map(|symbol| symbol.trim().to_string())
             .filter(|symbol| !symbol.is_empty())
             .collect();
+        let benchmark_code = normalize_benchmark(&settings.benchmark);
         Backtest {
-            symbols,
-            days: days.max(MIN_RANGE_DAYS),
-            decision_every: decision_every.max(1),
-            capital,
-            slippage_bps: slippage_bps.max(0.0),
-            max_volume_ratio: max_volume_ratio.clamp(0.0, 1.0),
+            symbols: settings.symbols.clone(),
+            days: settings.days.max(MIN_RANGE_DAYS),
+            decision_every: settings.decision_every.max(1),
+            capital: settings.capital,
+            slippage_bps: settings.slippage_bps.max(0.0),
+            max_volume_ratio: settings.max_volume_ratio.clamp(0.0, 1.0),
             bars: HashMap::new(),
             prev_close: HashMap::new(),
+            benchmark_bars: BTreeMap::new(),
+            benchmark_code: benchmark_code.clone(),
+            benchmark_source: format!("index:{benchmark_code}"),
+            settings,
+            replay_raw: HashMap::new(),
             dates: Vec::new(),
             pending: Vec::new(),
             trades: Vec::new(),
@@ -143,6 +250,23 @@ impl<'a, M: MarketSource, A: AiSource> Backtest<'a, M, A> {
     }
 
     pub fn run(&mut self) -> AppResult<BacktestResult> {
+        let signals_path = self.paths.backtest_signals();
+        if self.settings.replay {
+            self.replay_raw = read_signal_log(&signals_path);
+            util::log(&format!(
+                "[回测] 重放模式：不连接模型，信号来自 backtest_signals.jsonl（已读取 {} 条）",
+                self.replay_raw.len()
+            ));
+        } else {
+            if let Some(dir) = signals_path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            // 每次正常回测都从空日志开始；重放时绝不能覆盖上一次的输入
+            if let Err(err) = std::fs::write(&signals_path, "") {
+                util::log(&format!("[警告] 信号日志清空失败: {err}"));
+            }
+            util::log("[回测] 本次结果依赖模型输出，不可复现；如需复现请加 --replay");
+        }
         if !self.load() {
             return Ok(self.failure("K线数据不足或标的为空"));
         }
@@ -215,6 +339,21 @@ impl<'a, M: MarketSource, A: AiSource> Backtest<'a, M, A> {
             self.prev_close.insert(symbol, previous);
         }
         self.dates = all_dates.into_iter().collect();
+
+        // 基准指数单独取一次，绝不并入 self.dates，否则会挪动 start_index。
+        let bench_rows = self.md.get_kline(&self.benchmark_code, "1d", limit, None);
+        if bench_rows.len() < MIN_BENCHMARK_BARS {
+            util::log(&format!(
+                "[警告] 指数行情不可用（{} 仅 {} 根），基准回落到标的等权",
+                self.benchmark_code,
+                bench_rows.len()
+            ));
+        } else {
+            self.benchmark_bars = bench_rows
+                .into_iter()
+                .map(|bar| (bar.date.clone(), bar))
+                .collect();
+        }
         self.dates.len() >= MIN_DATES && !self.bars.is_empty()
     }
 
@@ -387,18 +526,53 @@ impl<'a, M: MarketSource, A: AiSource> Backtest<'a, M, A> {
             .map(|ind| ind.signal_txt)
             .unwrap_or_default();
             let context = account_context(sim);
-            let sig = self.ai.analyze(&AnalyzeRequest {
-                symbol: symbol.as_str(),
-                question,
-                technical: Some(technical.as_str()),
-                news: None,
-                experience: None,
-                extra: Some(context.as_str()),
-                as_of: Some(day),
-                verify_price: Some(bar.close),
-                expected_name: None,
-            });
-            self.ai_calls += 1;
+            // 重放时先克隆再匹配，避免持有 self 的不可变借用去改 ai_errors。
+            let replayed = self
+                .replay_raw
+                .get(&(day.to_string(), symbol.clone()))
+                .cloned();
+            let sig = if self.settings.replay {
+                match replayed {
+                    Some(raw) => {
+                        // 落地参数与在线解析保持一致，否则同一份 raw 会解析出不同信号。
+                        let opts = GroundOptions {
+                            verify_price: Some(bar.close),
+                            expected_name: None,
+                            ..GroundOptions::default()
+                        };
+                        crate::signal::parse_signal(&raw, symbol.as_str(), &opts)
+                    }
+                    None => {
+                        self.ai_errors += 1;
+                        util::log(&format!("[回测] 重放缺失信号: {day} {symbol}"));
+                        continue;
+                    }
+                }
+            } else {
+                let signal = self.ai.analyze(&AnalyzeRequest {
+                    symbol: symbol.as_str(),
+                    question,
+                    technical: Some(technical.as_str()),
+                    news: None,
+                    experience: None,
+                    extra: Some(context.as_str()),
+                    as_of: Some(day),
+                    verify_price: Some(bar.close),
+                    expected_name: None,
+                });
+                self.ai_calls += 1;
+                let entry = serde_json::json!({
+                    "date": day,
+                    "symbol": symbol,
+                    "question": question,
+                    "technical": technical,
+                    "signal": signal.signal.as_str(),
+                    "confidence": signal.confidence,
+                    "raw": truncate_chars(&signal.raw, SIGNAL_RAW_MAX_CHARS),
+                });
+                append_signal_log(&self.paths.backtest_signals(), &entry);
+                signal
+            };
             if matches!(sig.signal, SignalAction::Error) {
                 self.ai_errors += 1;
                 continue;
@@ -482,7 +656,38 @@ impl<'a, M: MarketSource, A: AiSource> Backtest<'a, M, A> {
     }
 
     // ---------- 指标 ----------
-    fn benchmark(&self, start_day: &str, end_day: &str) -> f64 {
+    /// 基准取指数在区间内的首尾收盘涨幅；第二项标明是否真的用上了指数。
+    fn benchmark(&self, start_day: &str, end_day: &str) -> (f64, bool) {
+        if let Some(value) = self.index_return(start_day, end_day) {
+            (value, true)
+        } else {
+            (self.equal_weight_benchmark(start_day, end_day), false)
+        }
+    }
+
+    fn index_return(&self, start_day: &str, end_day: &str) -> Option<f64> {
+        if self.benchmark_bars.is_empty() {
+            return None;
+        }
+        let start = self
+            .benchmark_bars
+            .iter()
+            .find(|(date, _)| date.as_str() >= start_day)
+            .map(|(_, bar)| bar)?;
+        let end = self
+            .benchmark_bars
+            .iter()
+            .rev()
+            .find(|(date, _)| date.as_str() <= end_day)
+            .map(|(_, bar)| bar)?;
+        if start.close > 0.0 && end.date >= start.date {
+            Some((end.close / start.close - 1.0) * 100.0)
+        } else {
+            None
+        }
+    }
+
+    fn equal_weight_benchmark(&self, start_day: &str, end_day: &str) -> f64 {
         let mut returns: Vec<f64> = Vec::new();
         for mapping in self.bars.values() {
             let start = match mapping.get(start_day) {
@@ -518,6 +723,34 @@ impl<'a, M: MarketSource, A: AiSource> Backtest<'a, M, A> {
         returns.iter().sum::<f64>() / returns.len() as f64 * 100.0
     }
 
+    /// 指数按回测交易日对齐成日收益序列；停牌日沿用最近一个收盘价。
+    fn benchmark_daily_returns(&self, days: &[String]) -> Vec<f64> {
+        if self.benchmark_bars.is_empty() {
+            return Vec::new();
+        }
+        let mut closes: Vec<f64> = Vec::new();
+        let mut last: Option<f64> = None;
+        for day in days {
+            let close = self
+                .benchmark_bars
+                .get(day)
+                .map(|bar| bar.close)
+                .or_else(|| {
+                    self.benchmark_bars
+                        .iter()
+                        .rev()
+                        .find(|(date, _)| date.as_str() <= day.as_str())
+                        .map(|(_, bar)| bar.close)
+                })
+                .or(last);
+            if let Some(close) = close {
+                closes.push(close);
+                last = Some(close);
+            }
+        }
+        daily_returns(&closes)
+    }
+
     fn collect(
         &mut self,
         days: &[String],
@@ -540,7 +773,14 @@ impl<'a, M: MarketSource, A: AiSource> Backtest<'a, M, A> {
         } else {
             0.0
         };
-        let benchmark = self.benchmark(&days[0], last_day);
+        let (benchmark, used_index) = self.benchmark(&days[0], last_day);
+        // 指数 K 线存在但覆盖不到区间时同样算不可用，不能把等权结果标成指数。
+        self.benchmark_source = if used_index {
+            format!("index:{}", self.benchmark_code)
+        } else {
+            util::log("[警告] 等权基准不是市场基准，超额收益不可用于评价策略");
+            "equal_weight_fallback".to_string()
+        };
         // 净值序列首日即起点，收益期数按“净值点数 - 1”算，至少 1 以避免除零
         let trading_days = (net_values.len().max(2) - 1) as f64;
         let annualized = if initial > 0.0 && final_assets > 0.0 {
@@ -549,6 +789,17 @@ impl<'a, M: MarketSource, A: AiSource> Backtest<'a, M, A> {
             0.0
         };
         let (closed_trades, win_rate, avg_trade_pct) = closed_stats(&sim.state.orders);
+        let drawdown = max_drawdown(&net_values);
+        let turnover = turnover_pct(&self.trades, &sim.state.daily_net_values);
+        let strategy_daily = daily_returns(&net_values);
+        let benchmark_daily = if used_index {
+            self.benchmark_daily_returns(days)
+        } else {
+            Vec::new()
+        };
+        let info_ratio = information_ratio(&strategy_daily, &benchmark_daily);
+        let yearly = yearly_returns(&sim.state.daily_net_values);
+        let consecutive_loss = max_consecutive_loss_days(&net_values);
 
         let mut result = BacktestResult {
             symbols: self.symbols.clone(),
@@ -560,9 +811,17 @@ impl<'a, M: MarketSource, A: AiSource> Backtest<'a, M, A> {
             total_return_pct: util::round_to(total_return, 2),
             annualized_pct: util::round_to(annualized, 2),
             benchmark_return_pct: util::round_to(benchmark, 2),
+            benchmark_code: self.benchmark_code.clone(),
+            benchmark_source: self.benchmark_source.clone(),
             excess_return_pct: util::round_to(total_return - benchmark, 2),
-            max_drawdown_pct: util::round_to(max_drawdown(&net_values), 2),
+            max_drawdown_pct: util::round_to(drawdown, 2),
             sharpe: util::round_to(sharpe(&net_values), 2),
+            sortino: util::round_to(sortino(&net_values), 2),
+            calmar: util::round_to(calmar(annualized, drawdown), 2),
+            information_ratio: util::round_to(info_ratio, 2),
+            max_consecutive_loss_days: consecutive_loss,
+            turnover_pct: util::round_to(turnover, 2),
+            yearly_returns: yearly,
             ai_calls: self.ai_calls,
             ai_errors: self.ai_errors,
             slippage_bps: self.slippage_bps,
@@ -583,9 +842,38 @@ impl<'a, M: MarketSource, A: AiSource> Backtest<'a, M, A> {
         }
         let text = serde_json::to_string_pretty(&result)?;
         std::fs::write(&path, format!("{text}\n"))?;
+        self.write_manifest(&result)?;
         result.output = Some(path.display().to_string());
         print_report(&result);
         Ok(result)
+    }
+
+    fn write_manifest(&self, result: &BacktestResult) -> AppResult<()> {
+        let manifest = BacktestManifest {
+            created_at: util::now_iso(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            symbols: self.symbols.clone(),
+            benchmark: self.settings.benchmark.clone(),
+            benchmark_source: self.benchmark_source.clone(),
+            start: result.start.clone(),
+            end: result.end.clone(),
+            trading_days: result.trading_days,
+            initial_capital: result.initial,
+            slippage_bps: self.slippage_bps,
+            max_volume_ratio: self.max_volume_ratio,
+            decision_every: self.decision_every,
+            ai_model: self.settings.ai_model.clone(),
+            prompt_version: PROMPT_VERSION.to_string(),
+            data_sources: DATA_SOURCES.iter().map(|item| item.to_string()).collect(),
+            deterministic: self.settings.replay,
+        };
+        let path = self.paths.backtest_manifest();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let text = serde_json::to_string_pretty(&manifest)?;
+        std::fs::write(&path, format!("{text}\n"))?;
+        Ok(())
     }
 
     fn failure(&self, message: &str) -> BacktestResult {
@@ -730,6 +1018,16 @@ fn print_report(result: &BacktestResult) {
         py_float(result.win_rate)
     ));
     util::log(&format!(
+        "风险: 索提诺 {} | 卡玛 {} | 信息比率 {} | 连亏 {} 日 | 换手 {}% | 基准 {} ({})",
+        py_float(result.sortino),
+        py_float(result.calmar),
+        py_float(result.information_ratio),
+        result.max_consecutive_loss_days,
+        py_float(result.turnover_pct),
+        result.benchmark_code,
+        result.benchmark_source
+    ));
+    util::log(&format!(
         "期末资产: {:.2} | 结果文件: {}",
         result.final_assets,
         result.output.clone().unwrap_or_default()
@@ -743,6 +1041,218 @@ fn py_float(value: f64) -> String {
     } else {
         format!("{value}")
     }
+}
+
+/// 日收益序列：相邻净值之比，起点非正时跳过。
+fn daily_returns(values: &[f64]) -> Vec<f64> {
+    values
+        .windows(2)
+        .filter(|pair| pair[0] > 0.0)
+        .map(|pair| pair[1] / pair[0] - 1.0)
+        .collect()
+}
+
+/// 索提诺：下行标准差只累计负日收益，但分母用全部收益数，年化乘 √252。
+/// 没有负收益或样本不足时返回 0，避免用 0 波动率算出无穷大的比率。
+pub fn sortino(values: &[f64]) -> f64 {
+    if values.len() < 3 {
+        return 0.0;
+    }
+    let returns = daily_returns(values);
+    if returns.len() < 2 || !returns.iter().any(|value| *value < 0.0) {
+        return 0.0;
+    }
+    let count = returns.len() as f64;
+    let mean = returns.iter().sum::<f64>() / count;
+    let downside_sq = returns
+        .iter()
+        .map(|value| {
+            let loss = value.min(0.0);
+            loss * loss
+        })
+        .sum::<f64>()
+        / count;
+    let downside = downside_sq.sqrt();
+    if downside == 0.0 {
+        0.0
+    } else {
+        mean / downside * 252f64.sqrt()
+    }
+}
+
+/// 卡玛：年化收益 ÷ 最大回撤；回撤为 0 时定义为 0。
+pub fn calmar(annualized_pct: f64, max_drawdown_pct: f64) -> f64 {
+    if max_drawdown_pct == 0.0 {
+        0.0
+    } else {
+        annualized_pct / max_drawdown_pct
+    }
+}
+
+/// 信息比率：超额日收益（策略 − 基准）均值 ÷ 其总体标准差 × √252。
+pub fn information_ratio(strategy: &[f64], benchmark: &[f64]) -> f64 {
+    let count = strategy.len().min(benchmark.len());
+    if count < 3 {
+        return 0.0;
+    }
+    let active: Vec<f64> = (0..count)
+        .map(|index| strategy[index] - benchmark[index])
+        .collect();
+    let n = count as f64;
+    let mean = active.iter().sum::<f64>() / n;
+    let variance = active
+        .iter()
+        .map(|value| (value - mean) * (value - mean))
+        .sum::<f64>()
+        / n;
+    let std = variance.sqrt();
+    if std == 0.0 {
+        0.0
+    } else {
+        mean / std * 252f64.sqrt()
+    }
+}
+
+/// 日收益连续为负的最大天数。
+pub fn max_consecutive_loss_days(values: &[f64]) -> usize {
+    let mut current = 0usize;
+    let mut worst = 0usize;
+    for value in daily_returns(values) {
+        if value < 0.0 {
+            current += 1;
+            worst = worst.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    worst
+}
+
+/// 换手率：全部成交金额（买卖都算）÷ 平均总资产 × 100。
+pub fn turnover_pct(trades: &[BacktestTrade], net_values: &[NetValue]) -> f64 {
+    if net_values.is_empty() {
+        return 0.0;
+    }
+    let average =
+        net_values.iter().map(|item| item.total_assets).sum::<f64>() / net_values.len() as f64;
+    if average <= 0.0 {
+        return 0.0;
+    }
+    let amount: f64 = trades
+        .iter()
+        .map(|trade| (trade.price * trade.shares as f64).abs())
+        .sum();
+    amount / average * 100.0
+}
+
+/// 分年度收益：跨年时以上一年最后一个净值作本年起点，组内取最后一个净值作终点。
+pub fn yearly_returns(net_values: &[NetValue]) -> Vec<YearlyReturn> {
+    let mut years: Vec<String> = Vec::new();
+    for item in net_values {
+        let year: String = item.date.chars().take(4).collect();
+        if year.len() == 4 && !years.contains(&year) {
+            years.push(year);
+        }
+    }
+    let mut result: Vec<YearlyReturn> = Vec::new();
+    for year in years {
+        let group: Vec<&NetValue> = net_values
+            .iter()
+            .filter(|item| item.date.starts_with(year.as_str()))
+            .collect();
+        let Some(last) = group.last() else {
+            continue;
+        };
+        let base = net_values
+            .iter()
+            .rev()
+            .find(|item| item.date.as_str() < year.as_str())
+            .map(|item| item.total_assets)
+            .unwrap_or_else(|| group.first().map(|item| item.total_assets).unwrap_or(0.0));
+        let value = if base > 0.0 {
+            (last.total_assets / base - 1.0) * 100.0
+        } else {
+            0.0
+        };
+        result.push(YearlyReturn {
+            year,
+            return_pct: util::round_to(value, 2),
+        });
+    }
+    result
+}
+
+/// 裸 6 位基准码按上证指数处理；显式 sh/sz/bj 前缀直接信任。
+/// 指数代码不能按个股首位推断市场：000001 同时是深市个股与上证指数。
+fn normalize_benchmark(input: &str) -> String {
+    let text = input.trim().to_lowercase();
+    let compact: String = text
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect();
+    if compact.len() == 8 {
+        let (prefix, digits) = compact.split_at(2);
+        if matches!(prefix, "sh" | "sz" | "bj") && digits.chars().all(|ch| ch.is_ascii_digit()) {
+            return compact;
+        }
+    }
+    let digits: String = text.chars().filter(|ch| ch.is_ascii_digit()).collect();
+    if digits.len() == 6 {
+        format!("sh{digits}")
+    } else {
+        util::log(&format!("[警告] 基准代码 {input} 不合法，改用 sh000300"));
+        "sh000300".to_string()
+    }
+}
+
+fn truncate_chars(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+
+/// 每次 AI 调用追加一行，追加而非覆盖，重放时按 (日期, 标的) 索引。
+fn append_signal_log(path: &std::path::Path, entry: &serde_json::Value) {
+    use std::io::Write;
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            if let Err(err) = writeln!(file, "{entry}") {
+                util::log(&format!("[警告] 信号日志写入失败: {err}"));
+            }
+        }
+        Err(err) => util::log(&format!("[警告] 信号日志打开失败: {err}")),
+    }
+}
+
+fn read_signal_log(path: &std::path::Path) -> HashMap<(String, String), String> {
+    let mut replay: HashMap<(String, String), String> = HashMap::new();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        util::log(&format!("[警告] 重放日志不存在: {}", path.display()));
+        return replay;
+    };
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let date = value
+            .get("date")
+            .and_then(|item| item.as_str())
+            .unwrap_or("");
+        let symbol = value
+            .get("symbol")
+            .and_then(|item| item.as_str())
+            .unwrap_or("");
+        let raw = value
+            .get("raw")
+            .and_then(|item| item.as_str())
+            .unwrap_or("");
+        if !date.is_empty() && !symbol.is_empty() {
+            replay.insert((date.to_string(), symbol.to_string()), raw.to_string());
+        }
+    }
+    replay
 }
 
 #[cfg(test)]
@@ -793,6 +1303,14 @@ mod tests {
 
     struct FakeMarket {
         rows: Vec<Bar>,
+        benchmark_rows: Option<Vec<Bar>>,
+    }
+
+    fn fake_market(rows: Vec<Bar>) -> FakeMarket {
+        FakeMarket {
+            rows,
+            benchmark_rows: None,
+        }
     }
 
     impl MarketSource for FakeMarket {
@@ -817,13 +1335,18 @@ mod tests {
 
         fn get_kline(
             &mut self,
-            _symbol: &str,
+            symbol: &str,
             _period: &str,
             limit: usize,
             end_date: Option<&str>,
         ) -> Vec<Bar> {
-            let filtered: Vec<Bar> = self
-                .rows
+            // 假行情默认只认识被测标的；没显式提供指数序列时应触发回落分支。
+            let source: Vec<Bar> = if symbol.starts_with("sh") || symbol.starts_with("sz") {
+                self.benchmark_rows.clone().unwrap_or_default()
+            } else {
+                self.rows.clone()
+            };
+            let filtered: Vec<Bar> = source
                 .iter()
                 .filter(|bar| match end_date {
                     Some(cut) => bar.date.as_str() <= cut,
@@ -847,14 +1370,18 @@ mod tests {
     struct FakeAi;
 
     impl AiSource for FakeAi {
-        fn analyze(&self, _req: &AnalyzeRequest<'_>) -> AiSignal {
-            AiSignal {
-                signal: SignalAction::Buy,
-                confidence: 0.9,
-                position_pct: Some(10),
-                reason: "test".to_string(),
-                ..AiSignal::default()
-            }
+        fn analyze(&self, req: &AnalyzeRequest<'_>) -> AiSignal {
+            // 直接复用真实解析入口，信号日志里的 raw 才能被重放逐字还原。
+            let raw = format!(
+                r#"{{"signal":"buy","confidence":0.9,"position_pct":10,"reason":"test","symbol":"{}"}}"#,
+                req.symbol
+            );
+            let opts = GroundOptions {
+                verify_price: req.verify_price,
+                expected_name: req.expected_name.map(|text| text.to_string()),
+                ..GroundOptions::default()
+            };
+            crate::signal::parse_signal(&raw, req.symbol, &opts)
         }
     }
 
@@ -915,9 +1442,7 @@ mod tests {
 
     #[test]
     fn benchmark_is_equal_weighted() {
-        let mut market = FakeMarket {
-            rows: make_rows(60, 10.0),
-        };
+        let mut market = fake_market(make_rows(60, 10.0));
         let ai = FakeAi;
         let paths = temp_paths("bench");
         let mut bt = Backtest::new(
@@ -925,17 +1450,13 @@ mod tests {
             &ai,
             &paths,
             Rc::new(Calendar::empty()),
-            vec!["600000".to_string()],
-            20,
-            5,
-            Some(50_000.0),
-            0.0,
-            0.05,
+            BacktestSettings::new(vec!["600000".to_string()], 20, 5, Some(50_000.0), 0.0, 0.05),
         );
         assert!(bt.load());
         let start = bt.dates[0].clone();
         let end = bt.dates[bt.dates.len() - 1].clone();
-        let benchmark = bt.benchmark(&start, &end);
+        let (benchmark, used_index) = bt.benchmark(&start, &end);
+        assert!(!used_index, "假行情未提供指数，应标记回落");
         // 单标的时基准就等于该标的的区间涨幅
         let mapping = bt.bars.get("600000").expect("有行情");
         let expected = mapping[&end].close / mapping[&start].close - 1.0;
@@ -945,9 +1466,7 @@ mod tests {
 
     #[test]
     fn start_index_waits_for_all_symbols() {
-        let mut market = FakeMarket {
-            rows: make_rows(60, 10.0),
-        };
+        let mut market = fake_market(make_rows(60, 10.0));
         let ai = FakeAi;
         let paths = temp_paths("start");
         let mut bt = Backtest::new(
@@ -955,12 +1474,7 @@ mod tests {
             &ai,
             &paths,
             Rc::new(Calendar::empty()),
-            vec!["600000".to_string()],
-            20,
-            5,
-            Some(50_000.0),
-            0.0,
-            0.05,
+            BacktestSettings::new(vec!["600000".to_string()], 20, 5, Some(50_000.0), 0.0, 0.05),
         );
         assert!(bt.load());
         // 单标的下起点就是第 30 根 K 线所在位置
@@ -988,7 +1502,7 @@ mod tests {
                 )
             })
             .collect();
-        let mut market = FakeMarket { rows };
+        let mut market = fake_market(rows);
         let ai = FakeAi;
         let paths = temp_paths("next-open");
         let mut bt = Backtest::new(
@@ -996,12 +1510,14 @@ mod tests {
             &ai,
             &paths,
             Rc::new(Calendar::empty()),
-            vec!["600000".to_string(), "000001".to_string()],
-            20,
-            5,
-            Some(50_000.0),
-            0.0,
-            0.05,
+            BacktestSettings::new(
+                vec!["600000".to_string(), "000001".to_string()],
+                20,
+                5,
+                Some(50_000.0),
+                0.0,
+                0.05,
+            ),
         );
         let result = bt.run().expect("回测可运行");
         assert!(result.error.is_none(), "错误: {:?}", result.error);
@@ -1056,7 +1572,7 @@ mod tests {
                 )
             })
             .collect();
-        let mut market = FakeMarket { rows };
+        let mut market = fake_market(rows);
         let ai = FakeAi;
         let paths = temp_paths("slip");
         let mut bt = Backtest::new(
@@ -1064,12 +1580,14 @@ mod tests {
             &ai,
             &paths,
             Rc::new(Calendar::empty()),
-            vec!["600000".to_string()],
-            20,
-            5,
-            Some(50_000.0),
-            50.0,
-            0.05,
+            BacktestSettings::new(
+                vec!["600000".to_string()],
+                20,
+                5,
+                Some(50_000.0),
+                50.0,
+                0.05,
+            ),
         );
         let result = bt.run().expect("回测可运行");
         let first_buy = result
@@ -1093,9 +1611,7 @@ mod tests {
 
     #[test]
     fn insufficient_data_returns_error_field() {
-        let mut market = FakeMarket {
-            rows: make_rows(20, 10.0),
-        };
+        let mut market = fake_market(make_rows(20, 10.0));
         let ai = FakeAi;
         let paths = temp_paths("short");
         let mut bt = Backtest::new(
@@ -1103,12 +1619,7 @@ mod tests {
             &ai,
             &paths,
             Rc::new(Calendar::empty()),
-            vec!["600000".to_string()],
-            60,
-            5,
-            Some(50_000.0),
-            5.0,
-            0.05,
+            BacktestSettings::new(vec!["600000".to_string()], 60, 5, Some(50_000.0), 5.0, 0.05),
         );
         let result = bt.run().expect("不 panic");
         assert_eq!(result.error.as_deref(), Some("K线数据不足或标的为空"));
@@ -1137,12 +1648,7 @@ mod tests {
             &ai,
             &paths,
             Rc::clone(&cal),
-            vec!["600519".to_string()],
-            60,
-            5,
-            Some(50_000.0),
-            5.0,
-            0.05,
+            BacktestSettings::new(vec!["600519".to_string()], 60, 5, Some(50_000.0), 5.0, 0.05),
         );
         let result = bt.run().expect("回测可运行");
         assert!(result.error.is_none(), "错误: {:?}", result.error);
@@ -1162,12 +1668,7 @@ mod tests {
             &ai,
             &paths,
             Rc::clone(&cal),
-            vec!["600000".to_string()],
-            60,
-            5,
-            Some(50_000.0),
-            5.0,
-            0.05,
+            BacktestSettings::new(vec!["600000".to_string()], 60, 5, Some(50_000.0), 5.0, 0.05),
         );
         let result = bt.run().expect("回测可运行");
         assert!(result.error.is_none(), "错误: {:?}", result.error);
@@ -1190,9 +1691,7 @@ mod tests {
     /// 这里一次性固化，避免后人「统一键名」时把看板/QA 的字段约定改坏。
     #[test]
     fn result_file_keeps_two_key_styles() {
-        let mut market = FakeMarket {
-            rows: make_rows(90, 10.0),
-        };
+        let mut market = fake_market(make_rows(90, 10.0));
         let ai = FakeAi;
         let paths = temp_paths("result-keys");
         let mut bt = Backtest::new(
@@ -1200,12 +1699,7 @@ mod tests {
             &ai,
             &paths,
             Rc::new(Calendar::empty()),
-            vec!["600000".to_string()],
-            20,
-            5,
-            Some(50_000.0),
-            0.0,
-            0.05,
+            BacktestSettings::new(vec!["600000".to_string()], 20, 5, Some(50_000.0), 0.0, 0.05),
         );
         let result = bt.run().expect("回测可运行");
         assert!(result.error.is_none(), "错误: {:?}", result.error);
@@ -1247,6 +1741,19 @@ mod tests {
         assert!(value["summary"]["浮动盈亏"].is_number());
         assert!(value["summary"]["持仓列表"].is_array());
         assert!(value["summary"]["熔断状态"].is_string());
+        // 新增的风险指标必须全部出现在落盘结果里
+        for key in [
+            "benchmark_code",
+            "benchmark_source",
+            "sortino",
+            "calmar",
+            "information_ratio",
+            "max_consecutive_loss_days",
+            "turnover_pct",
+            "yearly_returns",
+        ] {
+            assert!(value.get(key).is_some(), "结果文件缺少新指标 {key}");
+        }
         let _ = std::fs::remove_dir_all(&paths.base_dir);
     }
 
@@ -1285,5 +1792,265 @@ mod tests {
         assert!(context.contains("总资产 50000 元"));
         assert!(context.contains("持仓上限 3 只"));
         assert!(context.contains("T+1"));
+    }
+
+    #[test]
+    fn sortino_all_positive_returns_zero() {
+        assert_eq!(sortino(&[100.0, 101.0, 102.0, 103.0]), 0.0);
+        assert_eq!(sortino(&[100.0, 101.0]), 0.0);
+        // 有负收益时应给出有限值，且样本不足时为 0
+        assert!(sortino(&[100.0, 110.0, 90.0, 95.0, 100.0]).is_finite());
+    }
+
+    #[test]
+    fn calmar_zero_drawdown_is_zero() {
+        assert_eq!(calmar(12.0, 0.0), 0.0);
+        assert_eq!(calmar(12.0, 6.0), 2.0);
+    }
+
+    #[test]
+    fn information_ratio_constant_series_is_zero() {
+        assert_eq!(
+            information_ratio(&[0.01, 0.01, 0.01], &[0.01, 0.01, 0.01]),
+            0.0
+        );
+        assert_eq!(information_ratio(&[0.01, 0.02], &[0.01, 0.02]), 0.0);
+        assert_eq!(information_ratio(&[0.01, 0.02, 0.03], &[]), 0.0);
+    }
+
+    #[test]
+    fn consecutive_loss_days_counts_three() {
+        // 日收益依次为 [涨, 跌, 跌, 跌, 涨]
+        assert_eq!(
+            max_consecutive_loss_days(&[100.0, 110.0, 100.0, 90.0, 80.0, 100.0]),
+            3
+        );
+        assert_eq!(max_consecutive_loss_days(&[100.0, 110.0, 120.0]), 0);
+    }
+
+    #[test]
+    fn turnover_pct_uses_average_assets() {
+        let trades = vec![
+            BacktestTrade {
+                date: "2026-01-05".to_string(),
+                action: "BUY".to_string(),
+                code: "600000".to_string(),
+                name: "浦发银行".to_string(),
+                price: 10.0,
+                shares: 100,
+                reason: String::new(),
+            },
+            BacktestTrade {
+                date: "2026-01-06".to_string(),
+                action: "SELL".to_string(),
+                code: "600000".to_string(),
+                name: "浦发银行".to_string(),
+                price: 11.0,
+                shares: 100,
+                reason: String::new(),
+            },
+        ];
+        let values = vec![
+            NetValue {
+                date: "2026-01-05".to_string(),
+                total_assets: 1000.0,
+                cash: 0.0,
+                market_value: 0.0,
+            },
+            NetValue {
+                date: "2026-01-06".to_string(),
+                total_assets: 1000.0,
+                cash: 0.0,
+                market_value: 0.0,
+            },
+        ];
+        // (10*100 + 11*100) / 1000 * 100 = 210%
+        assert_eq!(turnover_pct(&trades, &values), 210.0);
+        assert_eq!(turnover_pct(&[], &values), 0.0);
+    }
+
+    #[test]
+    fn yearly_returns_groups_across_years() {
+        let values = vec![
+            NetValue {
+                date: "2025-12-30".to_string(),
+                total_assets: 1000.0,
+                cash: 0.0,
+                market_value: 0.0,
+            },
+            NetValue {
+                date: "2025-12-31".to_string(),
+                total_assets: 1100.0,
+                cash: 0.0,
+                market_value: 0.0,
+            },
+            NetValue {
+                date: "2026-01-02".to_string(),
+                total_assets: 1155.0,
+                cash: 0.0,
+                market_value: 0.0,
+            },
+            NetValue {
+                date: "2026-01-05".to_string(),
+                total_assets: 1210.0,
+                cash: 0.0,
+                market_value: 0.0,
+            },
+        ];
+        let yearly = yearly_returns(&values);
+        assert_eq!(yearly.len(), 2);
+        assert_eq!(yearly[0].year, "2025");
+        assert_eq!(yearly[0].return_pct, 10.0);
+        assert_eq!(yearly[1].year, "2026");
+        // 跨年以 2025 最后一个净值 1100 为起点：1210/1100 - 1 = 10%
+        assert_eq!(yearly[1].return_pct, 10.0);
+    }
+
+    #[test]
+    fn benchmark_code_normalization() {
+        assert_eq!(normalize_benchmark("000300"), "sh000300");
+        assert_eq!(normalize_benchmark(" sh000300 "), "sh000300");
+        assert_eq!(normalize_benchmark("SZ399300"), "sz399300");
+        assert_eq!(normalize_benchmark("bad"), "sh000300");
+    }
+
+    /// 核心不变量：基准必须来自指数 K 线，不能是回测标的的等权涨幅。
+    #[test]
+    fn benchmark_uses_index_not_equal_weight() {
+        let symbol_rows = make_rows(90, 10.0);
+        // 指数全程横盘 3000 点：区间涨幅固定 0.0%
+        let mut index_rows = make_rows(90, 10.0);
+        for row in index_rows.iter_mut() {
+            row.open = 3000.0;
+            row.close = 3000.0;
+            row.high = 3000.0;
+            row.low = 3000.0;
+        }
+        let mut market = FakeMarket {
+            rows: symbol_rows,
+            benchmark_rows: Some(index_rows),
+        };
+        let ai = FakeAi;
+        let paths = temp_paths("index-bench");
+        let mut bt = Backtest::new(
+            &mut market,
+            &ai,
+            &paths,
+            Rc::new(Calendar::empty()),
+            BacktestSettings::new(vec!["600000".to_string()], 20, 5, Some(50_000.0), 0.0, 0.05),
+        );
+        let result = bt.run().expect("回测可运行");
+        assert!(result.error.is_none(), "错误: {:?}", result.error);
+        assert_eq!(result.benchmark_return_pct, 0.0);
+        assert_eq!(result.benchmark_code, "sh000300");
+        assert_eq!(result.benchmark_source, "index:sh000300");
+        // 同一区间标的等权涨幅必须明显非零，才能证明上面的 0.0 不是"没算"
+        let equal_weight = bt.equal_weight_benchmark(&result.start, &result.end);
+        assert!(
+            equal_weight > 20.0,
+            "标的等权涨幅应显著为正，实际 {equal_weight}"
+        );
+        assert!(paths.backtest_manifest().exists());
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(paths.backtest_manifest()).expect("读 manifest"),
+        )
+        .expect("manifest 合法");
+        assert_eq!(manifest["benchmark"], "000300");
+        assert_eq!(manifest["benchmark_source"], "index:sh000300");
+        assert_eq!(manifest["app_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(manifest["prompt_version"], "v1");
+        assert_eq!(manifest["deterministic"], false);
+        assert_eq!(
+            manifest["data_sources"].as_array().map(|v| v.len()),
+            Some(3)
+        );
+        assert!(manifest.get("api_key").is_none(), "manifest 不得含 Key");
+        let _ = std::fs::remove_dir_all(&paths.base_dir);
+    }
+
+    #[test]
+    fn index_unavailable_falls_back_with_explicit_source() {
+        // benchmark_rows 给不足两根：必须回落等权并标来源
+        let mut market = FakeMarket {
+            rows: make_rows(90, 10.0),
+            benchmark_rows: Some(Vec::new()),
+        };
+        let ai = FakeAi;
+        let paths = temp_paths("bench-fallback");
+        let mut bt = Backtest::new(
+            &mut market,
+            &ai,
+            &paths,
+            Rc::new(Calendar::empty()),
+            BacktestSettings::new(vec!["600000".to_string()], 20, 5, Some(50_000.0), 0.0, 0.05),
+        );
+        let result = bt.run().expect("回测可运行");
+        assert_eq!(result.benchmark_source, "equal_weight_fallback");
+        assert!(result.benchmark_return_pct > 20.0);
+        let _ = std::fs::remove_dir_all(&paths.base_dir);
+    }
+
+    /// 同一份信号日志重放：不调模型，财务结果与首次逐字段一致。
+    #[test]
+    fn replay_matches_original_without_ai_calls() {
+        let paths = temp_paths("replay");
+        let run_once = |market: &mut FakeMarket, ai: &FakeAi, replay: bool| {
+            let mut settings =
+                BacktestSettings::new(vec!["600000".to_string()], 20, 5, Some(50_000.0), 0.0, 0.05);
+            settings.benchmark = "sh000300".to_string();
+            settings.replay = replay;
+            settings.ai_model = "fake-model".to_string();
+            let mut bt = Backtest::new(market, ai, &paths, Rc::new(Calendar::empty()), settings);
+            bt.run().expect("回测可运行")
+        };
+
+        let mut market1 = fake_market(make_rows(90, 10.0));
+        let ai = FakeAi;
+        let first = run_once(&mut market1, &ai, false);
+        assert!(first.ai_calls > 0, "首次应真的调用模型");
+        assert!(
+            !first.trades.is_empty(),
+            "首次必须有成交，否则重放对比无意义"
+        );
+        let signals = std::fs::read_to_string(paths.backtest_signals()).expect("读信号日志");
+        assert!(!signals.is_empty());
+        assert!(signals.lines().count() >= 1);
+        assert!(signals.contains("\"raw\""));
+
+        let mut market2 = fake_market(make_rows(90, 10.0));
+        let second = run_once(&mut market2, &ai, true);
+        assert_eq!(second.ai_calls, 0, "重放不得调用模型");
+        assert_eq!(second.ai_errors, 0);
+        // ai_calls 是运行元数据，按设计不同；财务与成交结果必须逐字段一致
+        assert_eq!(first.total_return_pct, second.total_return_pct);
+        assert_eq!(first.final_assets, second.final_assets);
+        assert_eq!(first.benchmark_return_pct, second.benchmark_return_pct);
+        assert_eq!(first.max_drawdown_pct, second.max_drawdown_pct);
+        assert_eq!(first.sharpe, second.sharpe);
+        assert_eq!(first.sortino, second.sortino);
+        assert_eq!(first.turnover_pct, second.turnover_pct);
+        assert_eq!(first.calmar, second.calmar);
+        assert_eq!(first.information_ratio, second.information_ratio);
+        assert_eq!(
+            first.max_consecutive_loss_days,
+            second.max_consecutive_loss_days
+        );
+        assert_eq!(first.yearly_returns.len(), second.yearly_returns.len());
+        assert_eq!(first.benchmark_code, second.benchmark_code);
+        assert_eq!(first.benchmark_source, second.benchmark_source);
+        assert_eq!(first.trades.len(), second.trades.len());
+        assert_eq!(first.net_values.len(), second.net_values.len());
+        for (left, right) in first.trades.iter().zip(second.trades.iter()) {
+            assert_eq!(left.date, right.date);
+            assert_eq!(left.price, right.price);
+            assert_eq!(left.shares, right.shares);
+        }
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(paths.backtest_manifest()).expect("读 manifest"),
+        )
+        .expect("manifest 合法");
+        assert_eq!(manifest["deterministic"], true);
+        assert_eq!(manifest["ai_model"], "fake-model");
+        let _ = std::fs::remove_dir_all(&paths.base_dir);
     }
 }

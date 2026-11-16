@@ -447,7 +447,20 @@ fn extract_payload(text: &str) -> Option<&str> {
 
 /// `600519 -> sh600519`、`000001 -> sz000001`、`920285 -> bj920285`。
 pub fn to_tencent_code(symbol: &str) -> Option<String> {
-    let mut text = symbol.trim().to_uppercase();
+    let raw = symbol.trim().to_uppercase();
+    // 显式写了市场前缀就照单全收，不再按代码首位重新推断。
+    // 000001 既是深市个股（平安银行）又是上证指数，剥掉前缀重推必然有一半错。
+    let compact: String = raw
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect();
+    if compact.len() == 8 {
+        let (prefix, digits) = compact.split_at(2);
+        if matches!(prefix, "SH" | "SZ" | "BJ") && digits.chars().all(|ch| ch.is_ascii_digit()) {
+            return Some(compact.to_lowercase());
+        }
+    }
+    let mut text = raw;
     for suffix in [".SH", ".SZ", ".BJ"] {
         text = text.replace(suffix, "");
     }
@@ -587,6 +600,13 @@ mod tests {
         // 带交易所后缀/前缀的写法也要归一
         assert_eq!(to_tencent_code("600519.SH").as_deref(), Some("sh600519"));
         assert_eq!(to_tencent_code("SH600519").as_deref(), Some("sh600519"));
+        // 指数必须带显式前缀：裸 000300 按个股规则会变成 sz000300（错）
+        assert_eq!(to_tencent_code("sh000300").as_deref(), Some("sh000300"));
+        assert_eq!(to_tencent_code("SH000300").as_deref(), Some("sh000300"));
+        assert_eq!(to_tencent_code("SZ399300").as_deref(), Some("sz399300"));
+        // 裸 6 位码仍是原来的个股推断
+        assert_eq!(to_tencent_code("000001").as_deref(), Some("sz000001"));
+        assert_eq!(to_tencent_code("000300").as_deref(), Some("sz000300"));
         assert_eq!(to_tencent_code("300750").as_deref(), Some("sz300750"));
         assert_eq!(to_tencent_code("830799").as_deref(), Some("bj830799"));
         assert_eq!(to_tencent_code("abc"), None);
