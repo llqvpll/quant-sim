@@ -585,9 +585,9 @@ impl Simulator {
         self.update_halt(util::parse_date(&day))?;
         let record = NetValue {
             date: day.clone(),
-            total_assets: money(self.total_assets()),
-            cash: money(self.state.cash),
-            market_value: money(self.market_value()),
+            total_assets: util::round_to(self.total_assets(), 2),
+            cash: util::round_to(self.state.cash, 2),
+            market_value: util::round_to(self.market_value(), 2),
         };
         match self
             .state
@@ -702,10 +702,10 @@ impl Simulator {
                 code: code.clone(),
                 name: pos.name.clone(),
                 shares: pos.shares,
-                avg_cost: price3(pos.avg_cost),
-                last_price: price3(pos.last_price),
+                avg_cost: util::round_to(pos.avg_cost, 3),
+                last_price: util::round_to(pos.last_price, 3),
                 pnl_pct: if pos.avg_cost != 0.0 {
-                    money((pos.last_price - pos.avg_cost) / pos.avg_cost * 100.0)
+                    util::round_to((pos.last_price - pos.avg_cost) / pos.avg_cost * 100.0, 2)
                 } else {
                     0.0
                 },
@@ -717,17 +717,17 @@ impl Simulator {
             .collect();
 
         Snapshot {
-            initial_capital: money(self.state.initial_capital),
-            total_assets: money(self.total_assets()),
-            total_return_pct: money(self.total_return_pct()),
-            cash: money(self.state.cash),
-            market_value: money(self.market_value()),
+            initial_capital: util::round_to(self.state.initial_capital, 2),
+            total_assets: util::round_to(self.total_assets(), 2),
+            total_return_pct: util::round_to(self.total_return_pct(), 2),
+            cash: util::round_to(self.state.cash, 2),
+            market_value: util::round_to(self.market_value(), 2),
             position_count: self.state.positions.len(),
             positions,
             order_count: self.state.orders.len(),
-            realized_pnl: money(realized),
-            unrealized_pnl: money(unrealized),
-            total_fee: money(total_fee),
+            realized_pnl: util::round_to(realized, 2),
+            unrealized_pnl: util::round_to(unrealized, 2),
+            total_fee: util::round_to(total_fee, 2),
             halt_status: if self.state.halted {
                 "熔断中"
             } else {
@@ -758,29 +758,6 @@ impl Simulator {
                 pos.available_date = Some(util::ymd(day));
             }
         }
-    }
-}
-
-/// 金额/百分比统一取整到 2 位，并把负零归一为正零。
-///
-/// `-0.0` 是合法的 f64，但 `{:.2}` 会打印成 `-0.00`，看板与命令行都会露出来；
-/// 空仓、零盈亏这些常见场景正好会踩到。
-fn money(value: f64) -> f64 {
-    let rounded = util::round_to(value, 2);
-    if rounded == 0.0 {
-        0.0
-    } else {
-        rounded
-    }
-}
-
-/// 持仓成本/现价展示保留 3 位，同样规避负零。
-fn price3(value: f64) -> f64 {
-    let rounded = util::round_to(value, 3);
-    if rounded == 0.0 {
-        0.0
-    } else {
-        rounded
     }
 }
 
