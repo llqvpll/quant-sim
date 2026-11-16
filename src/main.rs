@@ -596,12 +596,29 @@ fn cmd_factor_report(snapshot: &str, horizon: usize, panel: &str) -> AppResult<(
         fixed(report.icir, 3),
         fixed(report.positive_ic_ratio_pct, 1)
     ));
+    log(&format!(
+        "[因子] t={} (df={}) | p={} | 95% CI [{}, {}] | {}",
+        fixed(report.ic_t, 2),
+        report.ic_observations.max(2) - 1,
+        fixed(report.ic_p_value, 3),
+        fixed(report.ic_ci_low, 3),
+        fixed(report.ic_ci_high, 3),
+        if report.significant {
+            "拒绝 IC=0，因子有预测力"
+        } else {
+            "不能拒绝 IC=0，无证据表明有预测力"
+        }
+    ));
     let layer_text: Vec<String> = report
         .layers
         .iter()
         .map(|layer| format!("{} {}%", layer.layer, fixed(layer.mean_forward_pct, 2)))
         .collect();
     log(&format!("[因子] 分层：{}", layer_text.join(" | ")));
+    log(&format!(
+        "[因子] 分层单调性 Spearman {}（±1 为完全单调，0 为无关）",
+        fixed(report.layer_spearman, 2)
+    ));
     log(&format!("[因子] {}", report.note));
     if skipped > 0 {
         log(&format!(

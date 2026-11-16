@@ -26,6 +26,12 @@ pub const MIN_IC_OBSERVATIONS: usize = 20;
 pub const MIN_MEAN_WIDTH: f64 = 5.0;
 /// 分层数：低 / 中 / 高。
 pub const LAYER_COUNT: usize = 3;
+
+/// bootstrap 重抽样次数。1000 次足够稳定，且跑一次不到毫秒级。
+pub const BOOTSTRAP_ITERATIONS: usize = 1000;
+
+/// 显著性水平：p 低于该值且样本量达标，才把因子判为「显著」。
+pub const SIGNIFICANCE_LEVEL: f64 = 0.05;
 /// Pearson 至少要 3 对样本，2 个点必然落在一条直线上，相关系数没有意义。
 const MIN_PEARSON_SAMPLES: usize = 3;
 /// 读快照时一次取回的日 K 上限，够覆盖 `--days` 的常用取值。
@@ -68,6 +74,17 @@ pub struct FactorReport {
     /// `ic_mean / ic_std`，`ic_std` 为 0 时记 0。
     pub icir: f64,
     pub positive_ic_ratio_pct: f64,
+    /// IC 序列的 t 统计量：`mean / (std / sqrt(n))`。
+    pub ic_t: f64,
+    /// 双尾 p 值（t 分布，自由度 `n-1`）。
+    pub ic_p_value: f64,
+    /// IC 均值的 bootstrap 95% 置信区间下界。
+    pub ic_ci_low: f64,
+    pub ic_ci_high: f64,
+    /// 分层序号与各层平均前向收益的 Spearman 相关；±1 表示完全单调。
+    pub layer_spearman: f64,
+    /// 有效期内 p < 0.05 才算显著。样本不足时一律 false。
+    pub significant: bool,
     pub layers: Vec<LayerReturn>,
     pub sufficient: bool,
     pub note: String,
@@ -128,6 +145,159 @@ pub fn pearson(xs: &[f64], ys: &[f64]) -> Option<f64> {
     }
 }
 
+// ---------- 统计检验 ----------
+//
+// IC 均值单独看没有意义：21 期、标准差 0.27 时，均值 0.06 的 t 值只有 1.03，
+// 远不到 5% 显著的 2.086。这里补齐 t 检验、bootstrap 区间与分层单调性，
+// 让「有没有预测力」变成一个可以被拒绝的假设，而不是一句感觉。
+
+/// Lanczos 近似 ln Γ(x)。
+fn ln_gamma(x: f64) -> f64 {
+    const COF: [f64; 6] = [
+        76.180_091_729_471_46,
+        -86.505_320_329_416_77,
+        24.014_098_240_830_91,
+        -1.231_739_572_450_155,
+        0.120_865_097_386_617_9e-2,
+        -0.539_523_938_495_3e-5,
+    ];
+    let mut y = x;
+    let tmp = x + 5.5;
+    let tmp = tmp - (x + 0.5) * tmp.ln();
+    let mut ser = 1.000_000_000_190_015;
+    for cof in COF {
+        y += 1.0;
+        ser += cof / y;
+    }
+    -tmp + (2.506_628_274_631_000_5 * ser / x).ln()
+}
+
+/// 不完全 Beta 函数的连分数展开（Numerical Recipes 的 betacf）。
+fn betacf(a: f64, b: f64, x: f64) -> f64 {
+    const MAX_ITER: usize = 200;
+    const EPS: f64 = 3.0e-7;
+    const FPMIN: f64 = 1.0e-30;
+
+    let mut c = 1.0;
+    let mut d = 1.0 - (a + b) * x / (a + 1.0);
+    if d.abs() < FPMIN {
+        d = FPMIN;
+    }
+    d = 1.0 / d;
+    let mut h = d;
+    for step in 1..=MAX_ITER {
+        let m = step as f64;
+        let m2 = 2.0 * m;
+        let mut aa = m * (b - m) * x / ((a + m2 - 1.0) * (a + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < FPMIN {
+            d = FPMIN;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < FPMIN {
+            c = FPMIN;
+        }
+        d = 1.0 / d;
+        h *= d * c;
+        aa = -(a + m) * (a + b + m) * x / ((a + m2) * (a + m2 + 1.0));
+        d = 1.0 + aa * d;
+        if d.abs() < FPMIN {
+            d = FPMIN;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < FPMIN {
+            c = FPMIN;
+        }
+        d = 1.0 / d;
+        let del = d * c;
+        h *= del;
+        if (del - 1.0).abs() < EPS {
+            break;
+        }
+    }
+    h
+}
+
+/// 正则化不完全 Beta 函数 I_x(a, b)。
+fn betai(a: f64, b: f64, x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x >= 1.0 {
+        return 1.0;
+    }
+    let bt = (ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b) + a * x.ln() + b * (1.0 - x).ln()).exp();
+    if x < (a + 1.0) / (a + b + 2.0) {
+        bt * betacf(a, b, x) / a
+    } else {
+        1.0 - bt * betacf(b, a, 1.0 - x) / b
+    }
+}
+
+/// t 分布双尾 p 值。
+pub fn t_two_sided_p(t: f64, df: f64) -> f64 {
+    if df <= 0.0 || !t.is_finite() {
+        return 1.0;
+    }
+    betai(df / 2.0, 0.5, df / (df + t * t))
+}
+
+/// IC 均值的 bootstrap 置信区间。固定种子的 xorshift，同一份数据每次结果一致。
+pub fn bootstrap_mean_ci(values: &[f64], iterations: usize) -> (f64, f64) {
+    if values.is_empty() || iterations == 0 {
+        return (0.0, 0.0);
+    }
+    let mut state: u64 = 0x5EED_1234_ABCD_0001;
+    let mut means: Vec<f64> = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let mut sum = 0.0;
+        for _ in 0..values.len() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let index = (state % values.len() as u64) as usize;
+            sum += values[index];
+        }
+        means.push(sum / values.len() as f64);
+    }
+    means.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let low = (iterations as f64 * 0.025) as usize;
+    let high = ((iterations as f64 * 0.975) as usize).min(iterations - 1);
+    (means[low], means[high])
+}
+
+/// Spearman 秩相关：两组值先转秩再算 Pearson。
+pub fn spearman(xs: &[f64], ys: &[f64]) -> Option<f64> {
+    if xs.len() < 3 || xs.len() != ys.len() {
+        return None;
+    }
+    fn ranks(values: &[f64]) -> Vec<f64> {
+        let mut order: Vec<usize> = (0..values.len()).collect();
+        order.sort_by(|a, b| {
+            values[*a]
+                .partial_cmp(&values[*b])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut out = vec![0.0; values.len()];
+        // 并列值必须取平均秩。否则常数序列会拿到 1、2、3，
+        // 算出一个假的 +1，而它本该因为方差为零被判为无定义。
+        let mut start = 0;
+        while start < order.len() {
+            let mut end = start;
+            while end + 1 < order.len() && values[order[end + 1]] == values[order[start]] {
+                end += 1;
+            }
+            let average = (start + end) as f64 / 2.0 + 1.0;
+            for slot in start..=end {
+                out[order[slot]] = average;
+            }
+            start = end + 1;
+        }
+        out
+    }
+    pearson(&ranks(xs), &ranks(ys))
+}
+
 /// 汇总面板为一份报告。
 pub fn evaluate(rows: &[FactorRow], horizon: usize) -> FactorReport {
     // 按日期分组；组内至少 2 行才算一个可比的横截面。
@@ -180,6 +350,20 @@ pub fn evaluate(rows: &[FactorRow], horizon: usize) -> FactorReport {
         )
     };
 
+    let layers = build_layers(rows);
+    let ic_t = if ics.len() >= 2 && ic_std > 0.0 {
+        ic_mean / (ic_std / (ics.len() as f64).sqrt())
+    } else {
+        0.0
+    };
+    let degrees = (ics.len().max(2) - 1) as f64;
+    let ic_p_value = t_two_sided_p(ic_t, degrees);
+    let (ic_ci_low, ic_ci_high) = bootstrap_mean_ci(&ics, BOOTSTRAP_ITERATIONS);
+    let layer_ranks: Vec<f64> = (0..layers.len()).map(|index| index as f64).collect();
+    let layer_returns: Vec<f64> = layers.iter().map(|item| item.mean_forward_pct).collect();
+    let layer_spearman = spearman(&layer_ranks, &layer_returns).unwrap_or(0.0);
+    let significant = ics.len() >= MIN_IC_OBSERVATIONS && ic_p_value < SIGNIFICANCE_LEVEL;
+
     FactorReport {
         horizon_days: horizon,
         rows: rows.len(),
@@ -190,7 +374,13 @@ pub fn evaluate(rows: &[FactorRow], horizon: usize) -> FactorReport {
         ic_std: util::round_to(ic_std, 6),
         icir: util::round_to(icir, 6),
         positive_ic_ratio_pct: util::round_to(positive_ic_ratio_pct, 2),
-        layers: build_layers(rows),
+        ic_t: util::round_to(ic_t, 4),
+        ic_p_value: util::round_to(ic_p_value, 6),
+        ic_ci_low: util::round_to(ic_ci_low, 6),
+        ic_ci_high: util::round_to(ic_ci_high, 6),
+        layer_spearman: util::round_to(layer_spearman, 4),
+        significant,
+        layers,
         sufficient,
         note,
     }
@@ -914,5 +1104,109 @@ mod tests {
         assert_eq!(value["sufficient"], false);
         assert_eq!(value["layers"][0]["layer"], "全部");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn t_p_value_matches_textbook_critical_values() {
+        // df=20 时双尾 5% 临界值 2.086、1% 临界值 2.845（任意统计教材附表）。
+        assert!((t_two_sided_p(2.086, 20.0) - 0.05).abs() < 0.002);
+        assert!((t_two_sided_p(2.845, 20.0) - 0.01).abs() < 0.002);
+        // df=10 时 5% 临界值 2.228。
+        assert!((t_two_sided_p(2.228, 10.0) - 0.05).abs() < 0.002);
+        // t=0 时双尾概率为 1。
+        assert!((t_two_sided_p(0.0, 20.0) - 1.0).abs() < 1e-9);
+        // 自由度非法时退回 1，避免出现 NaN 混进报告。
+        assert_eq!(t_two_sided_p(2.0, 0.0), 1.0);
+    }
+
+    #[test]
+    fn bootstrap_ci_brackets_the_sample_mean() {
+        let values = [-0.4, -0.2, 0.0, 0.1, 0.3, 0.5, 0.2, -0.1, 0.4, 0.05];
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        let (low, high) = bootstrap_mean_ci(&values, 2000);
+        assert!(
+            low < mean && mean < high,
+            "区间 [{low}, {high}] 应包含均值 {mean}"
+        );
+        // 同一份数据两次调用必须完全一致，否则「可复现」是假的。
+        assert_eq!((low, high), bootstrap_mean_ci(&values, 2000));
+        // 空输入不能 panic。
+        assert_eq!(bootstrap_mean_ci(&[], 100), (0.0, 0.0));
+    }
+
+    #[test]
+    fn spearman_detects_layer_monotonicity() {
+        let layers = [0.0, 1.0, 2.0];
+        assert_eq!(
+            spearman(&layers, &[-1.0, 0.2, 1.5]),
+            Some(1.0),
+            "完全递增应为 +1"
+        );
+        assert_eq!(
+            spearman(&layers, &[1.5, 0.2, -1.0]),
+            Some(-1.0),
+            "完全递减应为 -1"
+        );
+        assert_eq!(
+            spearman(&layers, &[-1.0, 2.0, 0.5]),
+            Some(0.5),
+            "非单调的两个上升一个下降应为 0.5"
+        );
+        assert_eq!(spearman(&layers, &[1.0, 1.0, 1.0]), None, "常数序列无定义");
+    }
+
+    #[test]
+    fn evaluate_exposes_significance_fields() {
+        // 25 期 × 5 只、分数与收益完全同序：IC 恒为 1.0，t 应极大、p 接近 0。
+        let mut rows = Vec::new();
+        for day in 0..25 {
+            for index in 0..5 {
+                let score = index as f64 * 0.2;
+                rows.push(FactorRow {
+                    date: format!("2026-04-{day:02}"),
+                    symbol: format!("60000{index}"),
+                    score,
+                    forward_return_pct: score * 3.0,
+                });
+            }
+        }
+        let report = evaluate(&rows, 5);
+        assert_eq!(report.ic_observations, 25);
+        assert!((report.ic_mean - 1.0).abs() < 1e-9);
+        assert!(
+            report.ic_t > 100.0,
+            "ICIR 无穷大时 t 应极大，实际 {}",
+            report.ic_t
+        );
+        assert!(
+            report.ic_p_value < 1e-6,
+            "p 应接近 0，实际 {}",
+            report.ic_p_value
+        );
+        assert!(report.significant);
+        assert!((report.layer_spearman - 1.0).abs() < 1e-9);
+        // 置信区间同样应贴近 1.0。
+        assert!(report.ic_ci_low > 0.99 && report.ic_ci_high <= 1.0);
+    }
+
+    #[test]
+    fn evaluate_marks_insufficient_sample_as_not_significant() {
+        // 3 期即使 IC 很高，也不能判为显著。
+        let mut rows = Vec::new();
+        for day in 0..3 {
+            for index in 0..5 {
+                let score = index as f64 * 0.2;
+                rows.push(FactorRow {
+                    date: format!("2026-04-{day:02}"),
+                    symbol: format!("60000{index}"),
+                    score,
+                    forward_return_pct: score,
+                });
+            }
+        }
+        let report = evaluate(&rows, 5);
+        assert_eq!(report.ic_observations, 3);
+        assert!(!report.significant, "3 期样本不应判为显著");
+        assert!(!report.sufficient);
     }
 }

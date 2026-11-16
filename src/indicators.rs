@@ -679,7 +679,10 @@ mod tests {
                 let rsi14 = rsi(&closes, 14);
                 let (dif, dea, hist) = macd(&closes);
                 let atr14 = atr(&highs, &lows, &closes, 14);
-                let base = volumes[volumes.len() - 6..volumes.len() - 1].iter().sum::<f64>() / 5.0;
+                let base = volumes[volumes.len() - 6..volumes.len() - 1]
+                    .iter()
+                    .sum::<f64>()
+                    / 5.0;
                 let vr = if base > 0.0 {
                     volumes[volumes.len() - 1] / base
                 } else {
