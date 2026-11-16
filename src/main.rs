@@ -19,6 +19,7 @@ mod news;
 mod rules;
 mod signal;
 mod simulator;
+mod sizing;
 mod snapshot;
 mod store;
 mod types;

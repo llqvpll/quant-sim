@@ -9,12 +9,12 @@ use std::rc::Rc;
 use serde::Serialize;
 
 use crate::calendar::Calendar;
-use crate::config::Config;
 use crate::error::AppResult;
 use crate::indicators;
 use crate::rules;
 use crate::signal::{AnalyzeRequest, GroundOptions, SignalAction};
 use crate::simulator::{BuyRequest, SellRequest, Simulator, Snapshot};
+use crate::sizing;
 use crate::store::{self, NetValue, Order, Paths};
 use crate::types::{AiSource, Bar, MarketSource};
 use crate::util;
@@ -418,20 +418,27 @@ impl<'a, M: MarketSource, A: AiSource> Backtest<'a, M, A> {
                 rules::round_price(open * (1.0 - self.slippage_bps / 10_000.0))
             };
             let outcome = if order.action == "BUY" {
-                let budget = sim.total_assets() * order.ratio;
-                let mut shares = if price > 0.0 {
-                    rules::normalize_buy_shares(&code, (budget / price) as i64)
-                } else {
-                    0
-                };
                 // 单笔不超过当日成交量的 max_volume_ratio（K 线成交量单位为手）
-                if self.max_volume_ratio > 0.0 && volume > 0.0 {
-                    let cap = (volume * 100.0 * self.max_volume_ratio) as i64;
-                    shares = shares.min(cap / 100 * 100);
-                }
-                if shares <= 0 || shares as f64 * price < sim.cfg().min_trade_amount {
+                let volume_cap_shares = if self.max_volume_ratio > 0.0 && volume > 0.0 {
+                    Some((volume * 100.0 * self.max_volume_ratio) as i64)
+                } else {
+                    None
+                };
+                let sized = sizing::target_shares(
+                    &sizing::SizingInput {
+                        code: &code,
+                        price,
+                        total_assets: sim.total_assets(),
+                        ratio: order.ratio,
+                        volume_cap_shares,
+                    },
+                    sim.cfg(),
+                );
+                if let Some(reason) = sized.reason {
+                    util::log(&format!("[回测] {day} {code} 未成交: {reason}"));
                     continue;
                 }
+                let shares = sized.shares;
                 sim.buy(&BuyRequest {
                     code: &code,
                     name: &order.name,
@@ -590,14 +597,10 @@ impl<'a, M: MarketSource, A: AiSource> Backtest<'a, M, A> {
                 if confidence < sim.cfg().confidence_buy_threshold {
                     continue;
                 }
-                let mut ratio = confidence_ratio(confidence, sim.cfg());
-                if let Some(pct) = sig.position_pct {
-                    if pct == 0 {
-                        continue;
-                    }
-                    ratio = ratio.min(pct as f64 / 100.0);
+                if let Some(0) = sig.position_pct {
+                    continue;
                 }
-                let ratio = ratio.min(sim.cfg().confidence_max_ratio);
+                let ratio = sizing::resolve_ratio(confidence, sig.position_pct, sim.cfg());
                 self.queue(PendingOrder {
                     code: symbol.clone(),
                     name: symbol.clone(),
@@ -980,18 +983,6 @@ pub fn closed_stats(orders: &[Order]) -> (usize, f64, f64) {
     (pnls.len(), win_rate, util::round_to(mean, 2))
 }
 
-/// 置信度映射到仓位比例，超过阈值后线性放大到上限。
-fn confidence_ratio(confidence: f64, cfg: &Config) -> f64 {
-    let threshold = cfg.confidence_buy_threshold;
-    if confidence < threshold {
-        return 0.0;
-    }
-    let base = cfg.confidence_base_ratio;
-    let maximum = cfg.confidence_max_ratio;
-    let ratio = base + (confidence - threshold) * (maximum - base) / (1.0 - threshold).max(1e-9);
-    ratio.clamp(0.0, maximum)
-}
-
 fn account_context(sim: &Simulator) -> String {
     let cfg = sim.cfg();
     format!(
@@ -1267,6 +1258,7 @@ fn read_signal_log(path: &std::path::Path) -> HashMap<(String, String), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use crate::signal::AiSignal;
     use crate::store::{AiUsage, Position, State};
     use chrono::{Datelike, NaiveDate};
@@ -1767,13 +1759,8 @@ mod tests {
     }
 
     #[test]
-    fn confidence_ratio_and_context_are_stable() {
+    fn account_context_is_stable() {
         let cfg = Config::default();
-        assert_eq!(confidence_ratio(0.5, &cfg), 0.0);
-        assert!((confidence_ratio(0.65, &cfg) - 0.15).abs() < 1e-9);
-        assert!((confidence_ratio(1.0, &cfg) - 0.25).abs() < 1e-9);
-        assert!(confidence_ratio(0.9, &cfg) <= cfg.confidence_max_ratio);
-
         let state = State {
             version: 2,
             created_at: String::new(),

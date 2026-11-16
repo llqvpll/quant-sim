@@ -31,6 +31,7 @@ use crate::signal::{AiSignal, AnalyzeRequest, SignalAction};
 use crate::simulator::{
     BuyRequest, SellRequest, SignalLogInput, Simulator, Snapshot, TradeOutcome,
 };
+use crate::sizing;
 use crate::store::Paths;
 use crate::types::{
     AiSource, CachedSignal, Candidate, MarketSource, NewsSource, ScanAction, ScanReport,
@@ -654,32 +655,26 @@ impl<M: MarketSource, A: AiSource, N: NewsSource> Bot<M, A, N> {
             );
             return;
         }
-        let mut ratio = self.confidence_ratio(confidence);
-        if let Some(pct) = signal.position_pct {
-            if pct == 0 {
-                *skip_reason = "AI 建议 0 仓位".to_string();
-                return;
-            }
-            ratio = ratio.min(pct as f64 / 100.0);
-        }
-        ratio = ratio.min(cfg.confidence_max_ratio);
-        let budget = self.sim.total_assets() * ratio;
-        let mut shares = rules::normalize_buy_shares(code, (budget / price) as i64);
-        if shares <= 0 {
-            *skip_reason = format!(
-                "预算 {budget:.0} 元买不起最低 {} 股",
-                rules::min_buy_shares(code)
-            );
+        if let Some(0) = signal.position_pct {
+            *skip_reason = "AI 建议 0 仓位".to_string();
             return;
         }
-        if (shares as f64) * price < cfg.min_trade_amount {
-            *skip_reason = format!(
-                "单笔金额 {:.0} 元低于 {:.0} 元",
-                shares as f64 * price,
-                cfg.min_trade_amount
-            );
+        let ratio = sizing::resolve_ratio(confidence, signal.position_pct, &cfg);
+        let sized = sizing::target_shares(
+            &sizing::SizingInput {
+                code,
+                price,
+                total_assets: self.sim.total_assets(),
+                ratio,
+                volume_cap_shares: None,
+            },
+            &cfg,
+        );
+        if let Some(reason) = sized.reason {
+            *skip_reason = reason;
             return;
         }
+        let mut shares = sized.shares;
 
         let mut result = match self.place_buy(signal, candidate, shares, confidence, false) {
             Ok(item) => item,
@@ -691,9 +686,18 @@ impl<M: MarketSource, A: AiSource, N: NewsSource> Bot<M, A, N> {
         };
         // 仓位超限时按单票上限缩量再试一次，比直接放弃更接近人工操作。
         if !result.success && result.msg.contains("仓位超限") {
-            let max_budget = self.sim.total_assets() * cfg.max_single_position_ratio;
-            let shares2 = rules::normalize_buy_shares(code, (max_budget / price) as i64);
-            if shares2 > 0 {
+            let sized = sizing::target_shares(
+                &sizing::SizingInput {
+                    code,
+                    price,
+                    total_assets: self.sim.total_assets(),
+                    ratio: cfg.max_single_position_ratio,
+                    volume_cap_shares: None,
+                },
+                &cfg,
+            );
+            if sized.reason.is_none() && sized.shares > 0 {
+                let shares2 = sized.shares;
                 match self.place_buy(signal, candidate, shares2, confidence, true) {
                     Ok(item) => {
                         result = item;
@@ -775,20 +779,6 @@ impl<M: MarketSource, A: AiSource, N: NewsSource> Bot<M, A, N> {
             cfg.stop_loss_pct,
             cfg.take_profit_pct
         )
-    }
-
-    /// 置信度 → 仓位比例：门槛处从 base 起，满分封顶 max，线性插值。
-    fn confidence_ratio(&self, confidence: f64) -> f64 {
-        let cfg = self.cfg();
-        let threshold = cfg.confidence_buy_threshold;
-        let base = cfg.confidence_base_ratio;
-        let maximum = cfg.confidence_max_ratio;
-        if confidence < threshold {
-            return 0.0;
-        }
-        let span = (1.0 - threshold).max(1e-9);
-        let ratio = base + (confidence - threshold) * (maximum - base) / span;
-        ratio.clamp(0.0, maximum)
     }
 
     fn cache_signal(
@@ -1430,16 +1420,16 @@ mod tests {
     }
 
     #[test]
-    fn confidence_ratio_is_linear_and_capped() {
+    fn sizing_ratio_is_linear_and_capped() {
         let bot = make_bot("ratio", FakeAi::buy(), true, 0);
         let cfg = bot.cfg().clone();
         assert_eq!(
-            bot.confidence_ratio(cfg.confidence_buy_threshold - 0.01),
+            sizing::confidence_ratio(cfg.confidence_buy_threshold - 0.01, &cfg),
             0.0
         );
-        let at_threshold = bot.confidence_ratio(cfg.confidence_buy_threshold);
+        let at_threshold = sizing::confidence_ratio(cfg.confidence_buy_threshold, &cfg);
         assert!((at_threshold - cfg.confidence_base_ratio).abs() < 1e-9);
-        assert!((bot.confidence_ratio(1.0) - cfg.confidence_max_ratio).abs() < 1e-9);
+        assert!((sizing::confidence_ratio(1.0, &cfg) - cfg.confidence_max_ratio).abs() < 1e-9);
     }
 
     #[test]
