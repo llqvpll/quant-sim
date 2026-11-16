@@ -53,6 +53,8 @@ pub struct BacktestSettings {
     pub replay: bool,
     /// 模型名（绝不含 Key）。replay 时也随 manifest 落盘，便于确认当初用的模型。
     pub ai_model: String,
+    /// 使用的行情快照 id；None 表示读实时行情，结果会随新 K 线漂移。
+    pub snapshot_id: Option<String>,
 }
 
 impl Default for BacktestSettings {
@@ -67,6 +69,7 @@ impl Default for BacktestSettings {
             benchmark: "000300".to_string(),
             replay: false,
             ai_model: String::new(),
+            snapshot_id: None,
         }
     }
 }
@@ -118,6 +121,7 @@ pub struct BacktestManifest {
     pub prompt_version: String,
     pub data_sources: Vec<String>,
     pub deterministic: bool,
+    pub snapshot_id: Option<String>,
 }
 
 pub struct PendingOrder {
@@ -266,6 +270,10 @@ impl<'a, M: MarketSource, A: AiSource> Backtest<'a, M, A> {
                 util::log(&format!("[警告] 信号日志清空失败: {err}"));
             }
             util::log("[回测] 本次结果依赖模型输出，不可复现；如需复现请加 --replay");
+        }
+        match &self.settings.snapshot_id {
+            Some(id) => util::log(&format!("[回测] 行情快照 {id}（离线，区间固定）")),
+            None => util::log("[回测] 实时行情：区间会随新K线漂移，跨版本对比请先创建快照"),
         }
         if !self.load() {
             return Ok(self.failure("K线数据不足或标的为空"));
@@ -866,6 +874,7 @@ impl<'a, M: MarketSource, A: AiSource> Backtest<'a, M, A> {
             prompt_version: PROMPT_VERSION.to_string(),
             data_sources: DATA_SOURCES.iter().map(|item| item.to_string()).collect(),
             deterministic: self.settings.replay,
+            snapshot_id: self.settings.snapshot_id.clone(),
         };
         let path = self.paths.backtest_manifest();
         if let Some(dir) = path.parent() {
@@ -1184,7 +1193,7 @@ pub fn yearly_returns(net_values: &[NetValue]) -> Vec<YearlyReturn> {
 
 /// 裸 6 位基准码按上证指数处理；显式 sh/sz/bj 前缀直接信任。
 /// 指数代码不能按个股首位推断市场：000001 同时是深市个股与上证指数。
-fn normalize_benchmark(input: &str) -> String {
+pub fn normalize_benchmark(input: &str) -> String {
     let text = input.trim().to_lowercase();
     let compact: String = text
         .chars()

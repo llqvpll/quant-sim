@@ -1,6 +1,6 @@
 //! `quant-sim` 命令行入口。
 //!
-//! 五个子命令的职责边界很重要：只有 `run` 与 `backtest` 需要大模型，因此只有它们
+//! 六个子命令的职责边界很重要：只有 `run` 与 `backtest` 需要大模型，因此只有它们
 //! 会构造 `LlmClient`。`summary` / `reset` / `dashboard` 在没有 API Key 的机器上
 //! 也必须能用——否则用户连自己的持仓和成绩单都看不到。
 
@@ -19,6 +19,7 @@ mod news;
 mod rules;
 mod signal;
 mod simulator;
+mod snapshot;
 mod store;
 mod types;
 mod util;
@@ -37,6 +38,7 @@ use crate::llm::{LlmClient, LlmConfig};
 use crate::market::MarketData;
 use crate::simulator::Simulator;
 use crate::store::Paths;
+use crate::types::MarketSource;
 use crate::util::{log, now_local};
 
 /// 行情短请求超时（秒）。
@@ -116,7 +118,33 @@ enum Cmd {
         /// 从 data/backtest_signals.jsonl 重放信号，不再调用模型
         #[arg(long)]
         replay: bool,
+        /// 使用本地行情快照（快照 id 或 latest），不联网取行情
+        #[arg(long)]
+        snapshot: Option<String>,
     },
+    /// 管理本地行情快照
+    Snapshot {
+        #[command(subcommand)]
+        action: SnapshotCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum SnapshotCmd {
+    /// 抓取当前全市场列表与指定标的日 K，落盘成带 id 的快照
+    Create {
+        /// 逗号分隔的标的代码
+        #[arg(long, default_value = "")]
+        symbols: String,
+        /// 回测天数，决定快照多取多少根 K 线
+        #[arg(long)]
+        days: Option<u32>,
+        /// 基准指数代码
+        #[arg(long, default_value = "000300")]
+        benchmark: String,
+    },
+    /// 列出已有快照
+    List,
 }
 
 fn main() -> std::process::ExitCode {
@@ -154,6 +182,7 @@ fn dispatch(cli: Cli) -> AppResult<()> {
             max_volume_ratio,
             benchmark,
             replay,
+            snapshot,
         } => {
             let args = BacktestCliArgs {
                 symbol,
@@ -165,9 +194,18 @@ fn dispatch(cli: Cli) -> AppResult<()> {
                 max_volume_ratio,
                 benchmark,
                 replay,
+                snapshot,
             };
             cmd_backtest(&args)
         }
+        Cmd::Snapshot { action } => match action {
+            SnapshotCmd::Create {
+                symbols,
+                days,
+                benchmark,
+            } => cmd_snapshot_create(&symbols, days, &benchmark),
+            SnapshotCmd::List => cmd_snapshot_list(),
+        },
     }
 }
 
@@ -182,6 +220,7 @@ struct BacktestCliArgs {
     max_volume_ratio: f64,
     benchmark: String,
     replay: bool,
+    snapshot: Option<String>,
 }
 
 fn cmd_run(
@@ -310,7 +349,20 @@ fn cmd_backtest(args: &BacktestCliArgs) -> AppResult<()> {
     } else {
         LlmClient::new(llm_http, llm_cfg)
     };
-    let mut md = MarketData::new(HttpClient::new(fast, slow)?, Rc::clone(&cal));
+    // 快照模式完全不构造 MarketData：离线源结构体里没有任何 HTTP 客户端。
+    let mut source: Box<dyn MarketSource>;
+    let snapshot_id: Option<String>;
+    if let Some(requested) = &args.snapshot {
+        let resolved = snapshot::resolve_id(&paths, requested)?;
+        snapshot_id = Some(resolved.clone());
+        source = Box::new(snapshot::SnapshotSource::open(&paths, &resolved)?);
+    } else {
+        snapshot_id = None;
+        source = Box::new(MarketData::new(
+            HttpClient::new(fast, slow)?,
+            Rc::clone(&cal),
+        ));
+    }
 
     let mut settings = BacktestSettings::new(
         symbol_list,
@@ -323,13 +375,61 @@ fn cmd_backtest(args: &BacktestCliArgs) -> AppResult<()> {
     settings.benchmark = args.benchmark.clone();
     settings.replay = args.replay;
     settings.ai_model = ai_model;
-    let mut engine = Backtest::new(&mut md, &ai, &paths, Rc::clone(&cal), settings);
+    settings.snapshot_id = snapshot_id;
+    let mut engine = Backtest::new(&mut source, &ai, &paths, Rc::clone(&cal), settings);
     // 回测的头部与结果行（含结果文件路径）由 Backtest::run 自己打印，这里不重复。
     let result = engine.run()?;
     match result.error {
         Some(error) => Err(AppError::Business(error)),
         None => Ok(()),
     }
+}
+
+fn cmd_snapshot_create(symbols: &str, days: Option<u32>, benchmark: &str) -> AppResult<()> {
+    let list = parse_symbols("", symbols);
+    if list.is_empty() {
+        return Err(AppError::Invalid("--symbols 至少要给一个代码".to_string()));
+    }
+    let paths = Paths::resolve();
+    let cal = Rc::new(Calendar::load(&paths));
+    let fast = Duration::from_secs(FAST_TIMEOUT_SECS);
+    let slow = Duration::from_secs(
+        config::Config::default().ai_timeout_seconds as u64 + SLOW_TIMEOUT_MARGIN_SECS,
+    );
+    let mut md = MarketData::new(HttpClient::new(fast, slow)?, Rc::clone(&cal));
+    let (meta, files) = snapshot::create(
+        &paths,
+        &mut md,
+        &list,
+        benchmark,
+        days.unwrap_or(config::Config::default().backtest_days) as usize,
+    )?;
+    log(&format!(
+        "[快照] 已创建 {}：全市场 {} 只 / K线 {} 份 / 基准 {} / 文件 {} 个",
+        meta.id,
+        meta.symbols.len(),
+        meta.kline_symbols.len(),
+        meta.benchmark_source,
+        files
+    ));
+    log(&format!("[快照] {}", meta.note));
+    Ok(())
+}
+
+fn cmd_snapshot_list() -> AppResult<()> {
+    let paths = Paths::resolve();
+    let entries = snapshot::list(&paths)?;
+    if entries.is_empty() {
+        log("[快照] 暂无快照，可用 snapshot create 创建");
+        return Ok(());
+    }
+    for entry in entries {
+        log(&format!(
+            "[快照] {} | {} | K线 {} 只",
+            entry.id, entry.created_at, entry.kline_count
+        ));
+    }
+    Ok(())
 }
 
 /// `--symbols "600519,000001"` 优先；没给就用 `--symbol`。
@@ -432,6 +532,7 @@ mod tests {
                 max_volume_ratio,
                 benchmark,
                 replay,
+                snapshot,
             } => {
                 assert_eq!(symbol, "600519");
                 assert_eq!(symbols, "");
@@ -442,6 +543,7 @@ mod tests {
                 assert_eq!(max_volume_ratio, 0.05);
                 assert_eq!(benchmark, "000300");
                 assert!(!replay);
+                assert!(snapshot.is_none());
             }
             _ => panic!("应解析为 backtest 子命令"),
         }

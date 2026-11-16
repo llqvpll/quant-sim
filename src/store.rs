@@ -99,6 +99,18 @@ impl Paths {
     pub fn backtest_signals(&self) -> PathBuf {
         self.data_dir().join("backtest_signals.jsonl")
     }
+
+    pub fn snapshots_dir(&self) -> PathBuf {
+        self.data_dir().join("snapshots")
+    }
+
+    pub fn snapshot_dir(&self, id: &str) -> PathBuf {
+        self.snapshots_dir().join(id)
+    }
+
+    pub fn snapshot_latest(&self) -> PathBuf {
+        self.snapshots_dir().join("latest.json")
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

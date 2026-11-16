@@ -87,8 +87,11 @@ quant-sim backtest --symbol 600000 --days 60
 | `backtest --slippage-bps` / `--max-volume-ratio` | 滑点基点与单笔成交量占比上限 |
 | `backtest --benchmark` | 基准指数，默认 `000300`（沪深300），也可传 `sh000905` 这类带市场前缀的代码 |
 | `backtest --replay` | 重放上次落盘的信号日志，不调用模型，用于复现结果 |
+| `backtest --snapshot <id\|latest>` | 只读本地行情快照，不联网，区间固定 |
+| `snapshot create --symbols A,B [--days N]` | 抓取并落盘一份行情快照 |
+| `snapshot list` | 列出已有快照的 id、创建时间与标的数 |
 
-`summary`、`dashboard`、`reset` 不需要 API Key；`backtest --replay` 也不需要。
+`summary`、`dashboard`、`reset` 不需要 API Key；`backtest --replay`、`backtest --snapshot` 也不需要。
 
 ## 回测结果与可复现性
 
@@ -110,6 +113,29 @@ quant-sim backtest --symbol 600000 --days 60 --replay   # 不连模型，重放�
 | `data/backtest_result.json` | 结果与新增指标，字段说明见上 |
 
 重放时校验同一份 `manifest` 与 `signals.jsonl`，财务与成交字段应逐项一致；`ai_calls` 按设计不同（首次大于 0，重放为 0）。
+
+## 固定行情输入：快照
+
+默认回测直接拉实时 K 线。行情源每多一根新 K 线，相同 `--days` 的回测区间就会右移一天，基准、收益、成交全部跟着变，跨版本对比没有意义。要固定输入就用快照：
+
+```bash
+quant-sim snapshot create --symbols 600000,600519 --days 60
+quant-sim snapshot list
+quant-sim backtest --snapshot latest --symbol 600000 --days 60 --replay
+```
+
+一次快照写到 `data/snapshots/<yyyymmdd_HHMMSS>/`：
+
+| 文件 | 内容 |
+|---|---|
+| `meta.json` | 抓取时刻的全市场列表、实际抓了 K 线的标的、基准代码、幸存者偏差说明 |
+| `kline/<code>.json` | 指定标的的日 K；**只抓 `--symbols` 列的那几只**，不会去抓 5000 多只 |
+| `benchmark.json` | 沪深300 等基准指数的日 K |
+| `../latest.json` | 指向最新快照，`--snapshot latest` 读它 |
+
+快照模式完全不构造行情客户端，只读磁盘；快照缺某个标的会打印警告并返回空，**绝不联网补数据**。`backtest_manifest.json` 里的 `snapshot_id` 记录了用的是哪一份。同一份快照配合 `--replay` 连跑两次，`backtest_result.json` 应逐字节一致，连成交的日期、价格、股数都相同。
+
+**快照锁不住的东西**：`meta.json` 里的股票池是**抓取时刻**的当前全市场列表，无法回溯历史某一天真实上市/退市的全部标的。所以回测历史区间仍存在幸存者偏差，这一条不会因为用了快照而消失（见「已知限制」）。
 
 ## 数据源
 
@@ -197,8 +223,8 @@ quant-sim/
 - 未处理除权除息，长周期持有跨越除权日会失真；回测用前复权 K 线，实盘模拟用原始报价。
 - 新闻只做标题相关性与关键词情感，不是完整舆情分析。
 - 正常回测依赖模型输出，同样行情可能给出不同信号；需要可复现的结果请用 `--replay` 重放信号日志（见「回测结果与可复现性」）。
-- K 线是实时拉取而非历史快照，行情源每多一根新 K 线，相同 `--days` 的回测区间就会右移一天。做跨版本结果对比前，应先固定行情快照，否则两次回测的区间本身就不同。
-- 股票池取的是当前全市场列表，回测历史区间时存在幸存者偏差：今天仍在交易的标的才可能入选。
+- 不加 `--snapshot` 时 K 线是实时拉取的，行情源每多一根新 K 线，相同 `--days` 的回测区间就会右移一天；跨版本结果对比必须先固定行情快照。
+- 股票池取的是抓取时刻的当前全市场列表，回测历史区间时存在幸存者偏差：今天仍在交易的标的才可能入选。快照能锁死行情与区间，但**拿不到历史某一天真实上市/退市的全部标的**，因此这一条偏差无法靠代码消除，需要历史成分股数据源。
 - 回测滑点默认 5bp（0.05%），但 A 股最小价位是 0.01 元，价格低于 10 元的标的要推动一个价位需要更大的比例，因此低价股的滑点会被取整吸收，成交价可能正好等于开盘价。这是取整的结果，不是滑点未生效；要观察滑点效果请用 `--slippage-bps 50` 或 10 元以上的标的。
 - 节假日默认只排除周末，需要按年份维护 `data/holidays.json`。
 
