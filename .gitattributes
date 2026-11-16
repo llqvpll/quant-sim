@@ -1,4 +1,5 @@
 * text=auto eol=lf
-*.bat text eol=crlf
-*.png binary
-*.jpg binary
+
+# 让语言统计只按源码计算，不把锁文件与页面算进去
+Cargo.lock linguist-generated
+*.rs linguist-language=Rust
