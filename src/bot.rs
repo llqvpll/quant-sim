@@ -1048,8 +1048,9 @@ pub fn print_report(sim: &Simulator, report: &ScanReport) {
     }
 }
 
-/// f64 的负零会渲染成 "-0.00"，看着像 bug。`simulator::summary()` 已在源头归一，
-/// 这里再兜一层：任何将来新增的金额字段经过成绩单都不会露出 "-0.00"。
+/// 仅把负零归一为正零，不做取整：金额取整请用 `util::round_to`。
+/// f64 在 (-0.5, 0) 区间取整会得到负零，直接 `{:.2}` 会渲染成 "-0.00"，
+/// `simulator::summary()` 已在源头归一，这里再兜一层防止将来新增字段漏处理。
 fn money(value: f64) -> f64 {
     if value == 0.0 {
         0.0
