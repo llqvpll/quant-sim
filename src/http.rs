@@ -15,9 +15,9 @@ use crate::error::{AppError, AppResult};
 
 /// 值得重试的状态码：超时、限流、网关类。
 const RETRY_STATUS: [u16; 6] = [408, 429, 500, 502, 503, 504];
-/// 单次调用最多尝试 3 次（与 Python 版 `retries=3` 一致）。
+/// 单次调用最多尝试 3 次，配合退避足以覆盖常见的瞬时抖动。
 const MAX_ATTEMPTS: usize = 3;
-/// 并发线程上限，对齐 Python `fetch_many(max_workers=8)`。
+/// 并发线程上限：8 个足够吃满带宽，再多只会给对端添压力。
 const MAX_WORKERS: usize = 8;
 /// 失败响应摘要写入错误信息时的截断长度。
 const BODY_SNIPPET: usize = 200;
@@ -73,7 +73,7 @@ fn build_agent(timeout: Duration) -> AppResult<ureq::Agent> {
 }
 
 fn backoff(attempt: usize) {
-    // 退避 0.4*(n+1) 秒，与 Python `time.sleep(0.4 * (attempt + 1))` 对齐。
+    // 退避 0.4s、0.8s，给限流与网关抖动留出恢复时间。
     std::thread::sleep(Duration::from_millis(400 * (attempt as u64 + 1)));
 }
 

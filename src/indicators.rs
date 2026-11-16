@@ -1,7 +1,7 @@
 //! 技术指标与规则打分。
 //!
-//! 口径必须与 Langflow 节点一致：RSI/ATR 用 Wilder 平滑、MACD 柱等于 DIF-DEA、
-//! 盘中量比按已走时段折算。任何“顺手优化”都会让回测与线上对不上。
+//! 口径必须固定：RSI/ATR 用 Wilder 平滑、MACD 柱等于 DIF-DEA、
+//! 盘中量比按已走时段折算。任何“顺手优化”都会让回测与实盘对不上。
 
 use chrono::NaiveDateTime;
 use serde::Serialize;
@@ -39,7 +39,7 @@ pub struct RuleScore {
 }
 
 impl RuleScore {
-    /// 指标不足时调用方（Bot/回测）用它占位，语义对齐 Python 的“数据不足”。
+    /// 指标不足时调用方（Bot/回测）用它占位，grade 固定为“数据不足”。
     pub fn insufficient() -> RuleScore {
         RuleScore {
             score: 0,
@@ -468,7 +468,7 @@ mod tests {
         }
     }
 
-    /// 与 Python 测试同源的行情序列：起点 2026-01-05，涨跌交替，跳过周末。
+    /// 造一段确定性行情：起点 2026-01-05，涨跌交替，跳过周末。
     fn make_rows(count: usize) -> Vec<Bar> {
         let mut rows = Vec::with_capacity(count);
         let mut day = NaiveDate::from_ymd_opt(2026, 1, 5).expect("固定日期");

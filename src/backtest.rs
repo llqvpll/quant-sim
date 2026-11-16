@@ -56,7 +56,7 @@ pub struct BacktestResult {
     pub end: String,
     pub trading_days: usize,
     pub initial: f64,
-    /// JSON 键沿用 Python 的 `final`，字段名按设计书叫 final_assets。
+    /// 落盘键名固定为 `final`（外部契约），Rust 侧字段用 `final_assets` 表达语义。
     #[serde(rename = "final")]
     pub final_assets: f64,
     pub total_return_pct: f64,
@@ -75,7 +75,7 @@ pub struct BacktestResult {
     pub win_rate: f64,
     pub avg_trade_pct: f64,
     pub summary: Snapshot,
-    // 结果文件写盘时这两项还没有值，跳过序列化以保持与 Python 落盘字段一致
+    // 结果文件写盘时这两项还没有值，跳过序列化：落盘结构里不该出现恒为 null 的键
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -260,8 +260,11 @@ impl<'a, M: MarketSource, A: AiSource> Backtest<'a, M, A> {
                 .get(&code)
                 .and_then(|mapping| mapping.get(day))
                 .copied();
-            // A 股最小价位 0.01，成交价必须落在 tick 上。原 Python 版只对滑点价做乘法
-            // 不再取整，会产出 9.834915 这种不存在的价格，此处有意偏离。
+            // A 股最小价位 0.01，成交价必须落在 tick 上；不做取整会产出 9.834915
+            // 这种不存在的价格。
+            // 取整会让小额滑点被吸收：0.01 的最小变动意味着 5bp 滑点要推动一个 tick
+            // 需价格 ≥10 元，低价股的成交价会等于开盘价。这是预期行为，不是滑点未生效；
+            // 验证滑点链路请用 50bp 或 10 元以上的标的。
             let price = if order.action == "BUY" {
                 rules::round_price(open * (1.0 + self.slippage_bps / 10_000.0))
             } else {
@@ -733,7 +736,7 @@ fn print_report(result: &BacktestResult) {
     ));
 }
 
-/// Python 打印浮点时整数值带 `.0`，终端输出对齐用。
+/// 整数值的浮点打印带上 `.0`（如 1.0 而非 1），终端结果更易读。
 fn py_float(value: f64) -> String {
     if value.is_finite() && value.fract() == 0.0 {
         format!("{value:.1}")
@@ -763,7 +766,7 @@ mod tests {
         Paths { base_dir: base }
     }
 
-    /// 与 Python 测试同源的行情：开盘 = 昨收 + 0.1，收盘 = 开盘 + 0.1，逐日上涨。
+    /// 造一段确定性行情：开盘 = 昨收 + 0.1，收盘 = 开盘 + 0.1，逐日上涨。
     fn make_rows(count: usize, start: f64) -> Vec<Bar> {
         let mut rows = Vec::with_capacity(count);
         let mut day = NaiveDate::from_ymd_opt(2026, 1, 5).expect("固定日期");
@@ -965,7 +968,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&paths.base_dir);
     }
 
-    /// 本次移植最需要守住的不变量：成交价是执行日开盘价，不是决策日收盘价。
+    /// 最需要守住的不变量：成交价是执行日开盘价，不是决策日收盘价。
     #[test]
     fn executes_next_open_not_signal_close() {
         let rows = make_rows(90, 10.0);
@@ -1075,8 +1078,9 @@ mod tests {
             .find(|trade| trade.action == "BUY")
             .expect("应该有买入");
         let open = row_map.get(&first_buy.date).expect("成交日有行情").open;
-        // 50bp 滑点：买单成交价 = 开盘价 × (1 + 0.005)，再取整到分
-        let expected = rules::round_price(open * 1.005);
+        // 期望值用与实现完全相同的算式，避免 `1.005` 字面量与 `1 + 50/10000` 的末位差异
+        // 在 x.xx5 边界上偶发失败；同时仍能卡住"用收盘价成交/滑点方向反/漏取整"三种退化。
+        let expected = rules::round_price(open * (1.0 + 50.0 / 10_000.0));
         assert!(
             (first_buy.price - expected).abs() < 1e-9,
             "成交价 {} 应为开盘价 {} 加 50bp 滑点后取整的 {}",
@@ -1232,10 +1236,10 @@ mod tests {
         ] {
             assert!(value.get(key).is_some(), "结果文件缺少键 {key}");
         }
-        // 期末资产对外仍是 Python 的键名 final，`final_assets` 只存在于 Rust 侧
+        // 期末资产对外键名是 final，`final_assets` 只存在于 Rust 侧
         assert!(value.get("final").is_some());
         assert!(value.get("final_assets").is_none());
-        // 写盘时这两项还没值，且 Python 的落盘文件里也没有它们
+        // 写盘时这两项还没值，落盘结构里也不该出现恒为 null 的键
         assert!(value.get("output").is_none());
         assert!(value.get("error").is_none());
         // 内嵌成绩单仍是中文键

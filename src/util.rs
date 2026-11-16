@@ -1,7 +1,7 @@
 //! 通用工具：日志、时间、取整、URL 编码、文本清洗、短哈希，以及中文字符窗口搜索。
 //!
-//! 所有字符串截断都按"字符"而不是"字节"进行，与 Python 切片语义保持一致，
-//! 否则中文会被截半并产生非法 UTF-8。
+//! 所有字符串截断都按"字符"而不是"字节"进行：按字节切会把中文截成半个字符，
+//! 结果要么是非法 UTF-8，要么直接 panic。
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -22,12 +22,12 @@ pub fn now_local() -> NaiveDateTime {
     Local::now().naive_local()
 }
 
-/// ISO 时间戳（不含时区后缀），对齐 Python `isoformat(timespec="seconds")`。
+/// ISO 时间戳，秒级精度、不带时区后缀，形如 `2026-11-16T18:01:22`。
 pub fn now_iso() -> String {
     now_local().format("%Y-%m-%dT%H:%M:%S").to_string()
 }
 
-/// 带空格的日期时间，AI 信号的 `timestamp` 字段沿用 Python `strftime` 的写法。
+/// 带空格的日期时间，AI 信号的 `timestamp` 字段用它，形如 `2026-11-16 18:01:22`。
 pub fn now_stamp() -> String {
     now_local().format("%Y-%m-%d %H:%M:%S").to_string()
 }
@@ -85,7 +85,7 @@ pub fn parse_datetime(s: &str) -> Option<NaiveDateTime> {
             return Some(d);
         }
     }
-    // 带小数秒（Python isoformat 可能输出 6 位微秒）
+    // 兼容带小数秒的写法（最多 6 位微秒）
     if let Ok(d) = NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f") {
         return Some(d);
     }
@@ -93,7 +93,7 @@ pub fn parse_datetime(s: &str) -> Option<NaiveDateTime> {
 }
 
 /// 百分号编码（UTF-8 字节级）。未保留字符直接输出，空格编码为 `+`，
-/// 与 Python `urllib.parse.urlencode` 的行为一致。
+/// 与表单编码（application/x-www-form-urlencoded）的通行约定一致。
 pub fn encode_component(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for byte in s.as_bytes() {
@@ -148,8 +148,7 @@ pub fn take_chars(s: &str, n: usize) -> String {
 }
 
 /// JSON 值转文本：字符串原样返回，`null`/缺失为空串，其它按 JSON 字面量输出。
-/// 对齐 Python `str(value or "")` 的用法（接口字段类型不稳定：有时是字符串，
-/// 有时是数字）。
+/// 接口字段类型不稳定（有时字符串、有时数字、有时 null），统一转成文本再处理。
 pub fn json_text(value: Option<&serde_json::Value>) -> String {
     match value {
         Some(serde_json::Value::String(s)) => s.clone(),
@@ -239,7 +238,7 @@ mod tests {
     fn round_to_is_half_away_from_zero() {
         assert_eq!(round_to(2.345, 2), 2.35);
         assert_eq!(round_to(-2.345, 2), -2.35);
-        // 半远离零：2.5 / -2.5 都向远离零的方向进位，与 Python 银行家舍入不同。
+        // 半远离零：2.5 / -2.5 都向远离零的方向进位，而不是 .5 取偶的银行家舍入。
         assert_eq!(round_to(2.5, 0), 3.0);
         assert_eq!(round_to(-2.5, 0), -3.0);
         assert_eq!(round_to(1295.0, 2), 1295.0);

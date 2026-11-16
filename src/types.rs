@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-/// 实时行情快照。字段语义与 Python `_parse_quote` 返回的 dict 逐键对应。
+/// 实时行情快照。字段与腾讯行情接口返回的字段一一对应。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Quote {
     pub code: String,
@@ -70,7 +70,7 @@ pub struct RiskSignal {
 }
 
 /// 扫描报告里的一条已执行动作。`shares` 既可能是股数也可能是 `"全部"`，
-/// 因此用 `serde_json::Value` 承载，与 Python dict 的混合类型对齐。
+/// 混合类型用 `serde_json::Value` 承载，看板侧无需再做类型判断。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScanAction {
     pub code: String,

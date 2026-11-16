@@ -41,8 +41,9 @@ const POSITIVE_EXCEPTIONS: [&str; 3] = ["不错", "不但", "不仅"];
 /// 否定窗口长度（字符数）。
 const NEGATION_WINDOW: usize = 4;
 
-/// 关键词兜底时的置信度取值。注意它们随后会被 `low_trust_cap`（0.40）封顶，
-/// 看起来"没生效"是刻意保持与 Python 版一致的行为，不要改。
+/// 关键词兜底时的置信度取值。它们随后会被 `low_trust_cap`（0.40）封顶，
+/// 所以"感觉没生效"是刻意设计：这里表达的是关键词命中的原始强度，
+/// 最终置信度统一由 `GroundOptions::low_trust_cap` 收口，不要因为看不出效果而调大。
 const KEYWORD_BUY_SELL_CONF: f64 = 0.75;
 const KEYWORD_WAIT_CONF: f64 = 0.65;
 
@@ -112,7 +113,7 @@ pub struct AiSignal {
     /// 是否值得下一轮重试。HTTP 层已做 3 次退避重试；上层据此在报告里标注
     /// "不可重试"，避免用户误以为下一轮会自动恢复。
     pub retryable: bool,
-    /// 买卖词是否出现在"明确建议区"。对齐 Python 的临时键 `_advice_hit`。
+    /// 买卖词是否出现在"明确建议区"（交易建议/操作建议/建议总结/结论段落）。
     pub advice_hit: bool,
 }
 
@@ -219,8 +220,8 @@ impl Default for GroundOptions {
     }
 }
 
-/// 拼装 prompt。段落顺序与 Python `analyze_stock` 完全一致，
-/// 只额外追加"分析基准日"，防止回测时模型引用未来信息。
+/// 拼装 prompt。段落顺序固定为：问题 → 分析基准日 → 技术面 → 消息面 → 历史经验 →
+/// 账户情况 → 输出格式约束；基准日放在最前，防止回测时模型引用未来信息。
 pub fn build_prompt(req: &AnalyzeRequest<'_>) -> String {
     let mut parts: Vec<String> = vec![req.question.to_string()];
     if let Some(as_of) = req.as_of {
@@ -524,7 +525,8 @@ pub fn scan_lines(lines: &[&str]) -> Option<(SignalAction, f64)> {
     None
 }
 
-/// 从任意文本里取第一个 6 位连续数字（不做前后边界判断，对齐 Python `_symbol_digits`）。
+/// 从任意文本里取第一个 6 位连续数字，不判断前后边界
+/// （严格边界判断见 `find_six_digit_codes`）。
 fn symbol_digits(value: Option<&str>) -> Option<String> {
     let text = value?;
     let chars: Vec<char> = text.chars().collect();
@@ -700,7 +702,7 @@ mod tests {
         }
     }
 
-    /// 对齐 tests/test_ai_signal.py::test_confidence_normalization
+    /// 0~1、0~100、"80%" 三种写法都归一成 0~1；非法输入回落 0.5。
     #[test]
     fn confidence_normalization() {
         assert_eq!(normalize_confidence(Some(&json!(0.8))), 0.8);
@@ -711,7 +713,7 @@ mod tests {
         assert_eq!(normalize_confidence(Some(&json!("bad"))), 0.5);
     }
 
-    /// 对齐 test_json_chinese_signal
+    /// 中文枚举值（`"signal":"买入"`）也能解析成 buy。
     #[test]
     fn json_chinese_signal() {
         let parsed = parse_json_signal(r#"{"signal":"买入","confidence":80,"symbol":"600519"}"#)
@@ -720,7 +722,7 @@ mod tests {
         assert_eq!(parsed.confidence, 0.8);
     }
 
-    /// 对齐 test_json_symbol_mismatch_blocks
+    /// 回显标的与请求不一致时降级为 wait 并标记幻觉风险。
     #[test]
     fn json_symbol_mismatch_blocks() {
         let text = json!({
@@ -733,7 +735,7 @@ mod tests {
         assert!(result.hallucination_risk);
     }
 
-    /// 对齐 test_price_tolerance_is_three_percent
+    /// 引用现价偏差超过 3% 判编造并降级；2% 以内放行。
     #[test]
     fn price_tolerance_is_three_percent() {
         let text = json!({
@@ -752,7 +754,7 @@ mod tests {
         assert_eq!(result_ok.signal, SignalAction::Buy);
     }
 
-    /// 对齐 test_keyword_negation_and_advice_zone
+    /// 否定词作废买入信号；"不错"属例外；买卖词不在建议区时降级为 wait。
     #[test]
     fn keyword_negation_and_advice_zone() {
         let blocked = parse_signal("交易建议：不建议买入。", "600519", &opts_at(10.0));
@@ -773,7 +775,7 @@ mod tests {
         assert_eq!(fallback.signal, SignalAction::Wait);
     }
 
-    /// 对齐 test_stop_take_logic
+    /// 买入信号但止损不低于现价 → 逻辑矛盾，降级为 wait。
     #[test]
     fn stop_take_logic() {
         let text = json!({
@@ -786,11 +788,9 @@ mod tests {
         assert!(result.hallucination_risk);
     }
 
-    /// 对齐 test_selftest
+    /// 7 个样例覆盖：正常 JSON、错标的、置信度三写法、否定词、编造现价、止损矛盾。
     #[test]
     fn selftest() {
-        // 对齐 ai_signal.py 的 selftest_grounding：7 个样例覆盖正常、错标的、
-        // 置信度三写法、否定词、编造现价、止损矛盾。
         let samples: [(&str, &str, f64, SignalAction); 7] = [
             (
                 "JSON-正常",

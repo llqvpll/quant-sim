@@ -135,7 +135,7 @@ impl MarketData {
     }
 
     /// 批量行情：先查缓存，只并发请求缺失或过期的代码。
-    /// 返回的 map 以 6 位代码为键（不带交易所前缀），与 Python 版一致。
+    /// 返回的 map 以 6 位代码为键（不带 sh/sz/bj 前缀），调用方无需再去前缀。
     pub fn quotes(&mut self, symbols: &[String]) -> HashMap<String, Quote> {
         let mut result: HashMap<String, Quote> = HashMap::new();
         if symbols.is_empty() {

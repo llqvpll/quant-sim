@@ -136,7 +136,7 @@ fn window_start(hm: (u32, u32)) -> f64 {
     (hm.0 * 3600 + hm.1 * 60) as f64
 }
 
-/// 边界按整分钟闭区间：11:30:00 仍算盘中，11:30:01 已收盘（对齐 Python 的 time 比较）。
+/// 边界按整分钟闭区间：11:30:00 仍算盘中，11:30:01 已收盘。
 fn in_window(seconds: f64, start: (u32, u32), end: (u32, u32)) -> bool {
     seconds >= window_start(start) && seconds <= window_start(end)
 }
@@ -216,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn session_progress_matches_python() {
+    fn session_progress_hits_session_bounds() {
         let cal = Calendar::empty();
         assert_eq!(cal.session_progress(dt("2026-10-23T09:00:00")), 0.0);
         assert!((cal.session_progress(dt("2026-10-23T10:30:00")) - 0.25).abs() < 1e-9);

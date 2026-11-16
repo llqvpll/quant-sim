@@ -1,8 +1,8 @@
-//! 大模型客户端：原生直连任意 OpenAI 兼容接口。
+//! 大模型客户端：直连 OpenAI 兼容的 /chat/completions 接口，不依赖任何本地编排服务。
 //!
-//! 不再需要本地编排服务（原实现的 Langflow 要单独起一个 Python 服务，启动几十秒、
-//! 占几百 MB 内存）。这里只发一个 `POST {base_url}/chat/completions`，DeepSeek 用户
-//! 零配置即可使用：Key 缺失时回落到 `DEEPSEEK_API_KEY`，地址与模型也有对应回落。
+//! 换服务商只改 base_url 与 model，支持 DeepSeek、Qwen、Kimi 与本地 Ollama。
+//! DeepSeek 用户零配置即可使用：Key 缺失时回落到 `DEEPSEEK_API_KEY`，
+//! 地址与模型也有对应回落。
 //!
 //! 安全约定：API Key 只从环境变量读取，绝不写入 state.json，日志一律脱敏。
 

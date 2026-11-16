@@ -761,7 +761,7 @@ impl Simulator {
     }
 }
 
-/// Python 的 f64 打印总带小数点（-5.0 而非 -5），日志与提示文案沿用该风格。
+/// 浮点打印保留一位小数（-5.0 而非 -5），避免提示文案里出现突兀的整数阈值。
 fn py_float(value: f64) -> String {
     if value.is_finite() && value.fract() == 0.0 {
         format!("{value:.1}")

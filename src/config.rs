@@ -8,7 +8,7 @@ use serde_json::Value;
 
 pub const STATE_VERSION: u32 = 2;
 
-/// 31 个可调参数，键名与 Python 版 state.json 完全一致。
+/// 31 个可调参数；字段名就是 state.json 里的键名，改名会让旧账户读不回配置。
 #[derive(Clone, Debug, Serialize)]
 pub struct Config {
     // 账户
@@ -90,7 +90,7 @@ impl Default for Config {
 }
 
 /// 手写的反序列化让“怎么读都读得进来”：整个 Config 走 Value → 逐键合并，
-/// 与 Python 的 merge_config 等价。单个坏键只会回落默认值，不会连累整份 state。
+/// 只收已知键，单个坏键回落默认值，不连累整份 state。
 impl<'de> Deserialize<'de> for Config {
     fn deserialize<D>(deserializer: D) -> Result<Config, D::Error>
     where
@@ -104,8 +104,8 @@ impl<'de> Deserialize<'de> for Config {
 impl Config {
     /// 把旧 state 里的配置合并到默认值上，未知键丢弃。
     ///
-    /// 非数字/非有限值直接回落默认并记一条 `[配置校验]`：Rust 的结构体字段
-    /// 无法像 Python dict 那样暂存字符串，只能在此处就完成类型收敛。
+    /// 非数字/非有限值直接回落默认并记一条 `[配置校验]`：结构体字段是强类型，
+    /// 没有地方暂存非法值，只能在此处就完成类型收敛。
     pub fn merged(raw: Option<&Value>) -> Config {
         let mut issues: Vec<String> = Vec::new();
         let cfg = Config::merge_from(Config::default(), raw, &mut issues);
@@ -332,7 +332,7 @@ fn read_i32(
     read_f64(obj, key, base, issues).trunc() as i32
 }
 
-/// 与 Python `float()` 一致的宽松转换：数字与数字字符串都收。
+/// 宽松转换：数字与数字字符串都收，其余回落默认值。
 fn value_as_f64(value: &Value) -> Option<f64> {
     match value {
         Value::Number(number) => number.as_f64(),
@@ -341,7 +341,7 @@ fn value_as_f64(value: &Value) -> Option<f64> {
     }
 }
 
-/// 近似 Python `repr()`，只用于日志文案。
+/// 把 JSON 值渲染成便于人读的片段，只用于日志文案。
 fn py_repr(value: &Value) -> String {
     match value {
         Value::Null => "None".to_string(),

@@ -3,7 +3,7 @@
 //! 数据源通过 `MarketSource` / `AiSource` / `NewsSource` 注入，这里没有任何直接
 //! 网络代码，单测可以用假实现跑完整轮扫描。
 //!
-//! 几个都是 Python 版踩过坑的行为，改动前先想清楚：
+//! 以下几处行为经过反复调试才确定，改动前先看清对应测试：
 //! - 信号冷却按 `(代码, 问题类型)` 缓存，`error` 绝不入缓存，否则一次超时会让该
 //!   标的在整个冷却窗口里不再重试；
 //! - 持仓里没进候选池的，取**浮亏最弱**的一只补进来，保证止损有人看；
@@ -44,7 +44,7 @@ const FAST_TIMEOUT_SECS: u64 = 10;
 const SLOW_TIMEOUT_MARGIN_SECS: u64 = 30;
 /// 非交易时段的轮询间隔（秒）。
 const IDLE_POLL_SECS: u64 = 60;
-/// 循环间隔下限（秒），与 Python `max(30, interval)` 一致。
+/// 循环间隔下限（秒）：低于 30 秒会被抬到 30，避免把行情接口打成限流。
 const MIN_INTERVAL_SECS: u64 = 30;
 /// 休眠切片（秒），保证 Ctrl+C 能在 1 秒内被感知。
 const SLEEP_SLICE_SECS: u64 = 1;
@@ -1021,7 +1021,10 @@ pub fn print_report(sim: &Simulator, report: &ScanReport) {
     let summary = sim.summary();
     log(&format!(
         "总资产 {:.2} | 收益率 {}% | 持仓 {} 只 | {}",
-        summary.total_assets, summary.total_return_pct, summary.position_count, summary.halt_status
+        money(summary.total_assets),
+        money(summary.total_return_pct),
+        summary.position_count,
+        summary.halt_status
     ));
     for item in &report.actions {
         log(&format!(
@@ -1198,7 +1201,7 @@ impl Drop for LockGuard {
     }
 }
 
-/// 校验 CLI 数值参数，文案对齐 Python 的 argparse 报错。
+/// 校验 CLI 数值参数。失败文案直接面向命令行用户，需要能一眼看懂该怎么改。
 pub fn validate_run_args(
     capital: Option<f64>,
     scan: Option<u32>,
@@ -1365,7 +1368,7 @@ mod tests {
         Bot::with_parts(sim, FakeMarket { open }, ai, FakeNews, learner, paths, cal)
     }
 
-    /// 对齐 tests/test_main.py::test_scan_buys_once
+    /// 同一标的连续两轮扫描只下一单：第二次被"已持仓"拦下。
     #[test]
     fn scan_buys_once() {
         let mut bot = make_bot("buy-once", FakeAi::buy(), true, 0);
@@ -1377,7 +1380,7 @@ mod tests {
         assert_eq!(second.buy, 0);
     }
 
-    /// 对齐 test_cooldown_path_does_not_crash
+    /// 冷却命中时复用缓存信号、不再调用模型，但照常执行下单。
     #[test]
     fn cooldown_path_does_not_crash() {
         let mut bot = make_bot("cooldown", FakeAi::buy(), true, 0);
@@ -1389,7 +1392,7 @@ mod tests {
         assert_eq!(bot.ai.calls.get(), 0);
     }
 
-    /// 对齐 test_error_not_cached
+    /// error 信号不入缓存，下一轮仍会重新调用模型。
     #[test]
     fn error_not_cached() {
         let mut bot = make_bot("error", FakeAi::error(), true, 0);
@@ -1400,7 +1403,7 @@ mod tests {
         assert_eq!(bot.ai.calls.get(), 2);
     }
 
-    /// 对齐 test_scan_closed_market_skips
+    /// 休市且未加 --force 时跳过扫描：报告标记 market_closed，不调用模型。
     #[test]
     fn scan_closed_market_skips() {
         let mut bot = make_bot("closed", FakeAi::buy(), false, 0);
@@ -1477,7 +1480,7 @@ mod tests {
         assert_eq!(value["pid"].as_u64().unwrap(), std::process::id() as u64);
     }
 
-    /// 对齐 tests/test_lock.py
+    /// 建锁后文件存在且写着本进程 PID；重复获取应失败；释放后文件消失。
     #[test]
     fn lock_acquire_release() {
         let paths = temp_paths("lock");

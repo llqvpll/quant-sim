@@ -440,7 +440,7 @@ mod tests {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
     }
 
-    /// 对齐 tests/test_news.py::test_relevance_filter_drops_market_noise
+    /// 标题不含代码/公司名的泛新闻（盘后交易额、主力资金）会被过滤掉。
     #[test]
     fn relevance_filter_drops_market_noise() {
         let items = vec![
@@ -458,7 +458,7 @@ mod tests {
         assert!(result[0].title.contains("贵州茅台"));
     }
 
-    /// 对齐 test_negation_does_not_flip_sentiment
+    /// 否定窗口生效："未减持"不算利空，"不错"属例外，"不及预期"仍算利空。
     #[test]
     fn negation_does_not_flip_sentiment() {
         assert!(!NewsAnalyzer::hit("公司未减持股份", &["减持"]));
@@ -466,7 +466,7 @@ mod tests {
         assert!(NewsAnalyzer::hit("基本面不错，业绩增长", &["增长"]));
     }
 
-    /// 对齐 test_summary_text_not_duplicated
+    /// 摘要正文只出现一次"消息面偏多"，不会拼成"偏偏"。
     #[test]
     fn summary_text_not_duplicated() {
         let items = vec![
@@ -482,7 +482,7 @@ mod tests {
         assert_eq!(summary.sentiment, "偏多");
     }
 
-    /// 对齐 test_date_parse
+    /// 支持 `2026-10-21 16:26:00`、`2026年10月21日`、`10月21日` 三种日期写法。
     #[test]
     fn date_parse() {
         let today = day(2026, 10, 22);

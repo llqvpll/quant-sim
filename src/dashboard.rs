@@ -16,7 +16,7 @@ pub const DASHBOARD_HTML: &str = include_str!("../dashboard.html");
 
 const CSP: &str = "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'";
 
-/// 心跳超过该秒数视为机器人已停止（与 Python 版一致）。
+/// 心跳超过该秒数视为机器人已停止：单轮扫描可能很长，180 秒足以容忍正常抖动。
 const BEAT_TIMEOUT_SECS: i64 = 180;
 
 /// 请求路径的分发结果；抽成纯函数，便于不起服务器就覆盖全部路由。
@@ -29,7 +29,7 @@ pub enum ResponseKind {
 }
 
 pub fn route(path: &str) -> ResponseKind {
-    // 查询串不参与路由，与 Python 的 `self.path.split("?")[0]` 一致
+    // 查询串不参与路由：先按 ? 截断再匹配，避免 /api/state?t=1 落到 404
     let path = path.split('?').next().unwrap_or("");
     match path {
         "/" | "/index.html" | "/dashboard.html" => ResponseKind::Dashboard,

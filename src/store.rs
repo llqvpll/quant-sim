@@ -1,6 +1,6 @@
 //! 账户状态与持久化：state.json 的结构、原子写、备份与损坏恢复。
 //!
-//! 文件格式必须与 Python 版逐字段兼容，看板与旧 state 都要能直接读。
+//! 文件格式是外部契约：手改过的 state 与旧版本落盘文件都必须能直接读回。
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -174,7 +174,7 @@ pub struct State {
     pub config: Config,
 }
 
-/// 新建账户；资金非正时对齐 Python 的 ValueError 语义返回错误。
+/// 新建账户；资金非正时返回错误，而不是构造一个不可交易的账户。
 pub fn new_state(capital: Option<f64>) -> AppResult<State> {
     let init_cap = capital.unwrap_or_else(|| Config::default().initial_capital);
     if !init_cap.is_finite() || init_cap <= 0.0 {
@@ -378,7 +378,7 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(text)
 }
 
-/// 对齐 Python 的 `state.json.replace(".json", ".corrupt_<ts>.json")`。
+/// 损坏文件另存为 `state.corrupt_<yyyymmdd_HHMMSS>.json`，保留原名前缀便于追溯。
 fn corrupt_path(path: &Path) -> PathBuf {
     rename_with_stamp(path, "corrupt")
 }

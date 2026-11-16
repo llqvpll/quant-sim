@@ -53,7 +53,7 @@ pub struct ExperienceStats {
     pub best: f64,
     pub worst: f64,
     pub confidence_stats: BTreeMap<String, ConfidenceStat>,
-    // 样本为空时不写 recent，与 Python 的空统计结构保持一致
+    // 样本为空时不写 recent，空统计结构保持精简
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub recent: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -214,7 +214,7 @@ impl Learner {
             stats.total_trades,
             py_float(stats.win_rate),
             stats.avg_pnl,
-            // Python 在无亏损时打印整数 999，这里同样不带小数
+            // 无亏损时盈亏比记为 999，打印保持整数形态（不带 .0）
             stats.profit_factor,
             stats.avg_win,
             stats.avg_loss,
@@ -405,7 +405,7 @@ fn hold_minutes(start: &str, end: &str) -> f64 {
     (end - start).num_seconds() as f64 / 60.0
 }
 
-/// Python 打印浮点时总会带小数位（60.0 而非 60），prompt 文案沿用。
+/// 浮点打印保留一位小数（60.0 而非 60），避免 prompt 里的胜率被误读成整数。
 fn py_float(value: f64) -> String {
     if value.is_finite() && value.fract() == 0.0 {
         format!("{value:.1}")
