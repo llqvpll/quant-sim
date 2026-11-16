@@ -56,6 +56,11 @@ pub fn validate_walk_arg(value: Option<u32>) -> Result<usize, String> {
     }
 }
 
+/// 显式给出 --days 才按它截断；不传则取满 usable 个可用交易日。
+pub fn walk_total(limit: Option<usize>, usable: usize) -> usize {
+    limit.map(|value| value.min(usable)).unwrap_or(usable)
+}
+
 /// `--days` 是参与检验的总交易日上限：每段至少 min_days 天，
 /// 因此总天数必须足够，否则参数本身就不成立。
 pub fn validate_window_size(days: usize, windows: usize, min_days: usize) -> Result<(), String> {
@@ -322,6 +327,36 @@ mod tests {
         assert_eq!(parts_all.iter().map(|part| part.len()).sum::<usize>(), 151);
         assert_eq!(parts_all[0].first().unwrap(), &all[0]);
         assert_eq!(parts_all[2].last().unwrap(), &all[150]);
+    }
+
+    /// 不传 --days 时用满 usable=152；显式 60 时截断到 60。
+    #[test]
+    fn walk_days_limit_none_uses_all_usable() {
+        let usable = 152usize;
+        let all = dates(usable);
+        let windows = 3usize;
+
+        let total_all = walk_total(None, usable);
+        assert_eq!(total_all, 152);
+        assert!(validate_window_size(total_all, windows, 10).is_ok());
+        let parts_all = split_windows(&all[..total_all], windows, 10).expect("切窗");
+        assert_eq!(
+            parts_all.iter().map(|part| part.len()).collect::<Vec<_>>(),
+            vec![51, 51, 50]
+        );
+        assert_eq!(parts_all.iter().map(|part| part.len()).sum::<usize>(), 152);
+
+        let total_60 = walk_total(Some(60), usable);
+        assert_eq!(total_60, 60);
+        let parts_60 = split_windows(&all[..total_60], windows, 10).expect("切窗");
+        assert_eq!(
+            parts_60.iter().map(|part| part.len()).collect::<Vec<_>>(),
+            vec![20, 20, 20]
+        );
+        assert_eq!(parts_60.iter().map(|part| part.len()).sum::<usize>(), 60);
+
+        // 上限超过可用数时按可用数截断
+        assert_eq!(walk_total(Some(999), usable), 152);
     }
 
     #[test]

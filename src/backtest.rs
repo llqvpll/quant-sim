@@ -28,6 +28,8 @@ const MIN_DATES: usize = 45;
 const WARMUP_BARS: usize = 30;
 /// 回测区间至少这么多个交易日。
 const MIN_RANGE_DAYS: usize = 10;
+/// 多窗口不传 --days 时的取数上限，足够覆盖本地快照的全部日 K。
+const WALK_FULL_LOAD_LIMIT: usize = 640;
 /// 指数至少要有首尾两根才能算区间涨幅。
 const MIN_BENCHMARK_BARS: usize = 2;
 /// 信号日志里模型原文最多保留的字符数（按字符而非字节）。
@@ -363,7 +365,14 @@ impl<'a, M: MarketSource, A: AiSource> Backtest<'a, M, A> {
         if walk::needs_drift_warning(&self.settings.snapshot_id, self.settings.walk_windows) {
             util::log("[警告] 实时行情下窗口边界会随新K线漂移，跨版本对比请先创建快照");
         }
-        if !self.load() {
+        // 不传 --days 时把快照全部 K 线读进来，避免默认天数悄悄砍掉历史；
+        // 显式传了 --days 时仍沿用单段的取数口径。
+        let load_limit = if self.settings.walk_days_limit.is_none() {
+            WALK_FULL_LOAD_LIMIT
+        } else {
+            self.days + 120
+        };
+        if !self.load_with_limit(load_limit) {
             return Err(AppError::Invalid("K线数据不足或标的为空".to_string()));
         }
         let Some(start) = self.start_index() else {
@@ -371,23 +380,26 @@ impl<'a, M: MarketSource, A: AiSource> Backtest<'a, M, A> {
                 "无法找到所有标的同时具备 30 根 K 线的起点".to_string(),
             ));
         };
-        // 显式传 --days 才限制检验区间；不传则用满快照可用区间，避免默认天数悄悄砍掉历史。
-        let available_count = self.dates.len().saturating_sub(start);
-        let total = self
-            .settings
-            .walk_days_limit
-            .map(|limit| limit.min(available_count))
-            .unwrap_or(available_count);
+        // 显式传 --days 才限制检验区间；不传则用满快照可用区间。
+        let usable_count = self.dates.len().saturating_sub(start);
+        let total = walk::walk_total(self.settings.walk_days_limit, usable_count);
         let windows = self.settings.walk_windows;
+        if let Some(limit) = self.settings.walk_days_limit {
+            if total < limit {
+                util::log(&format!(
+                    "[回测] 可用交易日不足 {limit} 天，实际使用 {total} 天"
+                ));
+            }
+        }
         util::log(&format!(
-            "[回测] 滚动窗口使用 {total} 个交易日（快照可用 {available_count} 天）"
+            "[回测] 滚动窗口使用 {total} 个交易日（快照可用 {usable_count} 天）"
         ));
         walk::validate_window_size(total, windows, MIN_RANGE_DAYS).map_err(|err| {
             AppError::Invalid(format!("{err}；当前共 {total} 个交易日、{windows} 段"))
         })?;
-        let usable: Vec<String> = self.dates[start..start + total].to_vec();
-        let parts =
-            walk::split_windows(&usable, windows, MIN_RANGE_DAYS).map_err(AppError::Invalid)?;
+        let window_days: Vec<String> = self.dates[start..start + total].to_vec();
+        let parts = walk::split_windows(&window_days, windows, MIN_RANGE_DAYS)
+            .map_err(AppError::Invalid)?;
 
         let mut results: Vec<BacktestResult> = Vec::with_capacity(parts.len());
         for (index, days) in parts.iter().enumerate() {
@@ -436,7 +448,11 @@ impl<'a, M: MarketSource, A: AiSource> Backtest<'a, M, A> {
 
     // ---------- 数据 ----------
     fn load(&mut self) -> bool {
-        let limit = self.days + 120;
+        self.load_with_limit(self.days + 120)
+    }
+
+    /// 单段沿用 days+120；多窗口不传 --days 时取满快照全部 K 线。
+    fn load_with_limit(&mut self, limit: usize) -> bool {
         let symbols = self.symbols.clone();
         let mut all_dates: BTreeSet<String> = BTreeSet::new();
         for symbol in symbols {

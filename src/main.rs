@@ -104,6 +104,7 @@ enum Cmd {
         symbol: String,
         #[arg(long, default_value = "")]
         symbols: String,
+        /// 回测交易日数；多窗口模式下为参与检验的总天数上限，不传则用满快照可用区间
         #[arg(long)]
         days: Option<u32>,
         #[arg(long)]
@@ -124,7 +125,7 @@ enum Cmd {
         #[arg(long)]
         snapshot: Option<String>,
         /// 滚动窗口数，>=2 时切成互不重叠的连续窗口各跑一遍；
-        /// 多窗口模式下 --days 为参与检验的总交易日上限，不传则用满快照可用区间
+        /// 多窗口模式下 --days 为参与检验的总交易日上限，不传 --days 时使用快照全部可用交易日
         #[arg(long)]
         walk: Option<u32>,
     },
