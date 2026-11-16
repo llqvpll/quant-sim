@@ -223,7 +223,20 @@ impl Default for GroundOptions {
 /// 拼装 prompt。段落顺序固定为：问题 → 分析基准日 → 技术面 → 消息面 → 历史经验 →
 /// 账户情况 → 输出格式约束；基准日放在最前，防止回测时模型引用未来信息。
 pub fn build_prompt(req: &AnalyzeRequest<'_>) -> String {
-    let mut parts: Vec<String> = vec![req.question.to_string()];
+    // 标的代码必须写进 prompt。模型拿不到代码就会自己编一个（实测输出 000000），
+    // 回显校验随即判为不匹配、把信号降级成 wait，真实调用于是永远出不了买卖信号。
+    let head = match req.expected_name {
+        Some(name) if !name.trim().is_empty() => format!("【标的】{}（{}）", req.symbol, name),
+        _ => format!("【标的】{}", req.symbol),
+    };
+    let mut parts: Vec<String> = vec![
+        head,
+        format!(
+            "输出 JSON 的 symbol 字段必须原样回填 {}，不得改写、不得留空。",
+            req.symbol
+        ),
+        req.question.to_string(),
+    ];
     if let Some(as_of) = req.as_of {
         let day = take_chars(as_of, 10);
         if !day.is_empty() {
@@ -245,15 +258,18 @@ pub fn build_prompt(req: &AnalyzeRequest<'_>) -> String {
         ));
     }
     if let Some(extra) = req.extra {
-        parts.push(format!(
-            "【账户情况】{extra}\n请结合小资金与手续费成本考虑。"
-        ));
+        // 只陈述账户事实并约束仓位上限。早先这里写的是「请结合小资金与手续费成本考虑」，
+        // 实测把模型推成过度保守：连多头排列、MACD 红柱扩张的标的也只给 hold，
+        // 理由清一色是「最低 5 元佣金占比偏高」。成本该由下单时的金额门槛来管。
+        parts.push(format!("【账户情况】{extra}\n仓位不得超过上面的上限。"));
     }
     parts.push(
         "\n请综合【技术面】【消息面】【历史经验】三个维度，只输出一个 JSON 对象，\
 字段：symbol(6位代码)/signal(buy|sell|hold|wait)/confidence(0-100)/\
 trend(up|down|sideways)/stop_loss(数字或null)/take_profit(数字或null)/\
-position_pct(0-100)/reason(不超过120字)/risk(不超过60字)。"
+position_pct(0-100)/reason(不超过120字)/risk(不超过60字)。\n\
+signal 要按技术面给出的方向来定：偏多给 buy、偏空给 sell、已持仓且趋势未破给 hold，\
+只有确实看不出方向时才用 wait。不要仅因为资金规模小或手续费占比而放弃方向性判断。"
             .to_string(),
     );
     parts.join("\n")
@@ -930,6 +946,19 @@ mod tests {
         assert!(prompt.contains("分析基准日 2026-10-21"));
         assert!(prompt.contains("json") || prompt.contains("JSON"));
         assert!(prompt.contains("symbol(6位代码)"));
+        // 标的必须出现在 prompt 里，否则模型会自己编代码、回显校验再把它降级成 wait，
+        // 真实调用就永远没有买卖信号。这条曾经缺位，导致回测 78 次调用全是 wait。
+        assert!(prompt.contains("【标的】600519（贵州茅台）"));
+        assert!(prompt.contains("必须原样回填 600519"));
+    }
+
+    #[test]
+    fn prompt_states_symbol_even_without_name() {
+        let req = AnalyzeRequest::new("000001", "现在适合买入吗？");
+        let prompt = build_prompt(&req);
+        assert!(prompt.contains("【标的】000001"));
+        assert!(prompt.contains("必须原样回填 000001"));
+        assert!(!prompt.contains("【标的】000001（"));
     }
 
     #[test]

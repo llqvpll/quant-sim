@@ -35,7 +35,7 @@ const MIN_BENCHMARK_BARS: usize = 2;
 /// 信号日志里模型原文最多保留的字符数（按字符而非字节）。
 const SIGNAL_RAW_MAX_CHARS: usize = 2000;
 /// 改动 prompt 结构时必须同步递增，manifest 靠它区分不可比的结果。
-const PROMPT_VERSION: &str = "v1";
+const PROMPT_VERSION: &str = "v2";
 /// 行情与消息面的数据来源域名，写进 manifest 供结果溯源。
 const DATA_SOURCES: [&str; 3] = [
     "qt.gtimg.cn",
@@ -2089,7 +2089,7 @@ mod tests {
         assert_eq!(manifest["benchmark"], "000300");
         assert_eq!(manifest["benchmark_source"], "index:sh000300");
         assert_eq!(manifest["app_version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(manifest["prompt_version"], "v1");
+        assert_eq!(manifest["prompt_version"], "v2");
         assert_eq!(manifest["deterministic"], false);
         assert_eq!(
             manifest["data_sources"].as_array().map(|v| v.len()),
