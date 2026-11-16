@@ -549,13 +549,19 @@ impl Simulator {
                 continue;
             }
             let pnl_pct = (price - avg) / avg * 100.0;
+            // 持仓里的 stop_loss / take_profit 是买入时按绝对价格存的，配置里的却是
+            // 百分比。早先直接把价格和 pnl_pct 比，任何正数止损价都会让
+            // `pnl_pct <= stop` 恒成立，持仓在 T+1 次日被无条件平仓，止损价形同失效。
+            // 这里统一换算成相对均价的百分比再比较。
             let stop = pos
                 .stop_loss
-                .filter(|value| *value != 0.0)
+                .filter(|value| *value > 0.0)
+                .map(|value| (value - avg) / avg * 100.0)
                 .unwrap_or(self.cfg().stop_loss_pct);
             let take = pos
                 .take_profit
-                .filter(|value| *value != 0.0)
+                .filter(|value| *value > 0.0)
+                .map(|value| (value - avg) / avg * 100.0)
                 .unwrap_or(self.cfg().take_profit_pct);
             if pnl_pct <= stop {
                 signals.push(RiskSignal {
@@ -881,6 +887,64 @@ mod tests {
 
         req.price = 10.5;
         assert!(sim.buy(&req).expect("买入不报错").success);
+        let _ = std::fs::remove_dir_all(&paths.base_dir);
+    }
+
+    #[test]
+    fn price_based_stop_loss_scales_with_avg_cost() {
+        // 买入 10 元、模型给的止损价 9.5 元（约 -5%）。价格仍在成本附近时不该报止损，
+        // 跌到 -6% 才触发。修复前直接把 9.5 当百分比比较，pnl 0% <= 9.5 恒真，
+        // 买入当轮就会报止损，T+1 次日被无条件平仓。
+        let paths = temp_paths("stoploss_price");
+        let mut sim = open_sim(&paths);
+        let mut req = buy_req("600000", "浦发银行", 10.0, 100);
+        req.stop_loss = Some(9.5);
+        assert!(sim.buy(&req).expect("买入不报错").success);
+        let avg = sim.state.positions["600000"].avg_cost;
+
+        let mut prices = HashMap::new();
+        prices.insert("600000".to_string(), avg);
+        assert!(
+            sim.check_stop_loss_take_profit(&prices).is_empty(),
+            "持仓仍在成本价附近时不应触发止损"
+        );
+
+        prices.insert("600000".to_string(), avg * 0.94);
+        let signals = sim.check_stop_loss_take_profit(&prices);
+        assert_eq!(signals.len(), 1);
+        assert!(
+            signals[0].reason.contains("止损"),
+            "实际: {}",
+            signals[0].reason
+        );
+        let _ = std::fs::remove_dir_all(&paths.base_dir);
+    }
+
+    #[test]
+    fn price_based_take_profit_scales_with_avg_cost() {
+        // 止盈价 11 元（约 +10%），涨到 +11% 才触发，+3% 不该触发。
+        let paths = temp_paths("takeprofit_price");
+        let mut sim = open_sim(&paths);
+        let mut req = buy_req("600000", "浦发银行", 10.0, 100);
+        req.take_profit = Some(11.0);
+        assert!(sim.buy(&req).expect("买入不报错").success);
+        let avg = sim.state.positions["600000"].avg_cost;
+
+        let mut prices = HashMap::new();
+        prices.insert("600000".to_string(), avg * 1.03);
+        assert!(
+            sim.check_stop_loss_take_profit(&prices).is_empty(),
+            "涨 3% 不该触发止盈"
+        );
+
+        prices.insert("600000".to_string(), avg * 1.11);
+        let signals = sim.check_stop_loss_take_profit(&prices);
+        assert_eq!(signals.len(), 1);
+        assert!(
+            signals[0].reason.contains("止盈"),
+            "实际: {}",
+            signals[0].reason
+        );
         let _ = std::fs::remove_dir_all(&paths.base_dir);
     }
 
