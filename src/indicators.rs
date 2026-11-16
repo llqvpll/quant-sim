@@ -630,4 +630,65 @@ mod tests {
         assert_eq!(trend(Some(10.0), Some(11.0), None, None, &down), "短期偏空");
         assert_eq!(trend(None, None, None, None, &up), "震荡");
     }
+
+    /// 指标计算的性能基准，工作量与 quant-sim-aero 的 benchmark.py 对齐
+    /// （120×50000 / 1000×10000 / 10000×2000，全指标算一遍）。
+    /// 手动运行：cargo test --release bench_indicators -- --ignored --nocapture
+    #[test]
+    #[ignore = "性能基准，不参与常规测试"]
+    fn bench_indicators() {
+        use std::time::Instant;
+
+        fn make_bars(n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+            let mut closes = Vec::with_capacity(n);
+            let mut highs = Vec::with_capacity(n);
+            let mut lows = Vec::with_capacity(n);
+            let mut volumes = Vec::with_capacity(n);
+            let mut price = 100.0f64;
+            let mut state = 42u64;
+            let mut next = || {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (state >> 33) as f64 / (u32::MAX as f64)
+            };
+            for _ in 0..n {
+                let open = price;
+                let close = price + (next() - 0.5) * 10.0;
+                let high = open.max(close) + next() * 3.0;
+                let low = open.min(close) - next() * 3.0;
+                let volume = 100_000.0 + next() * 900_000.0;
+                closes.push(close);
+                highs.push(high);
+                lows.push(low);
+                volumes.push(volume);
+                price = close;
+            }
+            (closes, highs, lows, volumes)
+        }
+
+        for (n, iters) in [(120usize, 50_000usize), (1_000, 10_000), (10_000, 2_000)] {
+            let (closes, highs, lows, volumes) = make_bars(n);
+            let start = Instant::now();
+            let mut sink = 0.0f64;
+            for _ in 0..iters {
+                let ma5 = ma(&closes, 5).unwrap_or(0.0);
+                let ma10 = ma(&closes, 10).unwrap_or(0.0);
+                let ma20 = ma(&closes, 20).unwrap_or(0.0);
+                let ma60 = ma(&closes, 60).unwrap_or(0.0);
+                let rsi14 = rsi(&closes, 14);
+                let (dif, dea, hist) = macd(&closes);
+                let atr14 = atr(&highs, &lows, &closes, 14);
+                let base = volumes[volumes.len() - 6..volumes.len() - 1].iter().sum::<f64>() / 5.0;
+                let vr = if base > 0.0 {
+                    volumes[volumes.len() - 1] / base
+                } else {
+                    1.0
+                };
+                sink += ma5 + ma10 + ma20 + ma60 + rsi14 + dif + dea + hist + atr14 + vr;
+            }
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            println!("{n:>6} 根 K 线 × {iters:>6} 次全指标: {ms:8.1} ms  (校验和 {sink:.0})");
+        }
+    }
 }
