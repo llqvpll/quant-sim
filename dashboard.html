@@ -39,15 +39,15 @@ td.empty, td .empty { text-align:center; color:#999; }
 <body>
 
 <div class="header">
-    <h1>📈 AI 模拟量化交易看板</h1>
+    <h1>AI 模拟量化交易看板</h1>
     <div class="status"><span class="dot gray" id="bot-dot"></span><span id="bot-text">连接中...</span></div>
 </div>
 <div class="sub-bar">
     自动刷新 <b id="last-refresh">--:--:--</b> · <span id="last-scan">尚未扫描</span> · <span id="cap-info">虚拟资金 --</span>
 </div>
 
-<div class="err" id="err" style="display:none">⚠️ 无法连接看板服务，请确认已通过桌面「一键启动」脚本运行本系统。</div>
-<div class="halt-banner" id="halt-banner">⛔ 熔断中：总资产回撤超阈值，已暂停新买入</div>
+<div class="err" id="err" style="display:none">无法连接看板服务，请先执行 quant-sim dashboard 启动本地服务。</div>
+<div class="halt-banner" id="halt-banner">熔断中：总资产回撤超阈值，已暂停新买入</div>
 
 <div class="grid">
     <div class="card">
@@ -102,7 +102,7 @@ td.empty, td .empty { text-align:center; color:#999; }
 </div>
 
 <div class="panel">
-    <h2>🧠 交易统计 <small>历史已平仓样本，样本不足时仅供参考</small></h2>
+    <h2>交易统计 <small>历史已平仓样本，样本不足时仅供参考</small></h2>
     <div class="grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:14px">
         <div class="card">
             <div class="label">已平仓交易</div>
@@ -123,7 +123,7 @@ td.empty, td .empty { text-align:center; color:#999; }
     </div>
     <div id="exp-detail" style="color:#8b95a7;font-size:13px;line-height:1.8">暂无交易经验, 完成几笔交易后自动生成</div>
     <div style="margin-top:10px;color:#8b95a7;font-size:12px;border-top:1px solid #2a3550;padding-top:10px">
-        💰 成本控制: 累计 AI 调用 <b id="usage-calls" style="color:#c9d1e0">0</b> 次 · 失败 <b id="usage-errors" style="color:#c9d1e0">0</b> 次 · 规则预筛跳过 <b id="usage-skipped" style="color:#c9d1e0">0</b> 只 · 估算费用 <b id="usage-cost" style="color:#c9d1e0">¥0</b>
+        成本控制: 累计 AI 调用 <b id="usage-calls" style="color:#c9d1e0">0</b> 次 · 失败 <b id="usage-errors" style="color:#c9d1e0">0</b> 次 · 规则预筛跳过 <b id="usage-skipped" style="color:#c9d1e0">0</b> 只 · 估算费用 <b id="usage-cost" style="color:#c9d1e0">¥0</b>
     </div>
 </div>
 
@@ -173,7 +173,7 @@ function renderCards(state) {
     const halt = $('halt-banner');
     if (state.halted) {
         halt.style.display = 'block';
-        halt.textContent = '⛔ 熔断中：' + (state.halt_reason || '总资产回撤超阈值，已暂停新买入');
+        halt.textContent = '熔断中：' + (state.halt_reason || '总资产回撤超阈值，已暂停新买入');
     } else {
         halt.style.display = 'none';
     }
@@ -350,7 +350,7 @@ function renderSignals(state) {
         const color = colorMap[sig] || '#999';
         const label = { buy: '买入', sell: '卖出', wait: '观望', hold: '持有', error: '错误' }[sig] || esc(sig);
         const conf = (s.confidence == null) ? '--' : (Number(s.confidence) * 100).toFixed(0) + '%';
-        const hallu = s.hallucination_risk ? '<span style="color:#ff4d4f;font-weight:bold">⚠幻觉</span>' : '<span style="color:#8b95a7">正常</span>';
+        const hallu = s.hallucination_risk ? '<span style="color:#ff4d4f;font-weight:bold">幻觉</span>' : '<span style="color:#8b95a7">正常</span>';
         const note = s.skip_reason ? ('跳过: ' + s.skip_reason) : (s.reason || '');
         html += '<tr><td>' + esc(String(s.time || '').slice(0, 16)) + '</td>'
               + '<td>' + esc(s.name || '') + '<br><small>' + esc(s.code || '') + '</small></td>'

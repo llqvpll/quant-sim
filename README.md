@@ -1,192 +1,170 @@
-# quant-sim — A 股 AI 模拟盘量化交易系统（v2）
+# quant-sim
 
-用 Langflow + DeepSeek 驱动一套**纯模拟盘**的 A 股交易流程：盘中扫描候选股 → 规则预筛 → AI 生成结构化信号 → 风控执行模拟买卖 → 实时看板。
+A 股 AI 模拟盘。盘中扫描候选股，技术指标做规则预筛，再把少量候选交给大模型出结构化买卖信号，由内置风控执行模拟下单，附带实时看板与组合回测。不接券商、不碰真钱。
 
-> ⚠️ **免责声明**：本项目全程不碰真钱，仅用于研究和个人学习。AI 信号不构成投资建议；市场有风险，任何交易决策与损益由使用者自行承担。
+Rust 单二进制实现，无运行时依赖、无本地服务、无需预热。行情来自腾讯/新浪/东财的公开接口。
 
-## v2 修复了什么
+> **免责声明**：本项目仅用于研究和个人学习，不构成投资建议。市场有风险，任何决策与损益由使用者自行承担。
 
-v1 更像“能跑通的 demo”；v2 重点修了会让结论失真或直接跑不起来的问题：
+## 特性
 
-- **flow 与客户端对齐**：仓库自带 `flow_current.json` 已更新为 JSON 输出 + `as_of` 截断 + `symbol` 回显；客户端启动/`check_flow.py` 可检查契约。
-- **冷却崩溃**：修复 `news_txt` 未初始化导致的 `UnboundLocalError`；错误信号不再缓存 30 分钟。
-- **A 股规则**：T+1、涨跌停（主板 10%/创业板科创板 20%/北交所 30%/主板 ST 5%）、板块手数（科创板 200 股起、北交所 100 股起）、停牌无数据不成交。
-- **回测口径**：收盘决策、**次日开盘**成交；滑点、成交量占比约束；多标的共享一个账户；等权买入持有基准；年化/最大回撤/夏普/胜率。
-- **费用**：卖出印花税改为 0.05%，补过户费；`avg_cost` 含买入费用，已平仓与浮动盈亏口径一致。
-- **配置单一来源**：所有风控/费用参数只从 `state["config"]` 读取，不再出现“看板写 -1%、实际按 -5%”。
-- **状态安全**：原子写 + `.bak` 备份；价格/股数校验；损坏状态自动另存并告警。
-- **熔断恢复**：回撤恢复或冷却期满自动解除，不再空仓永久锁死。
-- **看板**：本地时区日期、转义、显示执行/跳过原因、心跳线程、移除未使用的 ECharts 文件。
-- **启动器**：首次运行自动建 `data/`，不再 `FileNotFoundError`；健康检查端口；非 Windows 不再使用专属 flag。
-- **安全**：`check_flow.py` 不再覆盖受版本控制的 flow；导出写到忽略的 `flow_current.local.json` 并脱敏 API Key。
-- **工程**：补 pytest + CI、删除个人路径脚本、去重看板 HTML、修复未使用代码。
-
-## 功能
-
-- **AI 信号**：Langflow 流程调用 DeepSeek，输出 `symbol/signal/confidence/trend/stop_loss/take_profit/position_pct/reason/risk`。
-- **模拟交易**：虚拟账户、订单、持仓、每日净值、FIFO 已平仓盈亏、交易记录持久化。
-- **组合回测**：多标的、次日开盘成交、T+1/涨跌停/手数/费用、基准与风险指标。
-- **实时看板**：10 秒刷新，显示净值、持仓、交易、信号与跳过原因；心跳判断在线。
-- **成本控制**：全市场列表 → 规则预筛 → 只把少量候选送 AI。
-- **零第三方 Python 依赖**：客户端只用标准库；Langflow 服务端另装。
-
-## 项目结构
-
-```
-quant-sim/
-├── main.py               # 主循环：扫描 → AI 分析 → 模拟交易 → 成绩单
-├── ai_signal.py          # AI 信号集成（Langflow、解析、防幻觉）
-├── simulator.py          # 模拟交易引擎（账户/订单/持仓/净值）
-├── backtest.py           # 组合回测（次日开盘、基准、指标）
-├── market_rules.py       # 板块/手数/涨跌停/T+1
-├── trading_calendar.py   # 交易时段、节假日文件、下一交易日
-├── config.py             # 唯一默认配置与校验
-├── market_data.py        # 腾讯行情/K线 + 新浪全市场列表
-├── technical.py          # MA/RSI/MACD/ATR/量比/规则打分
-├── news.py               # 个股新闻相关性过滤 + 情感
-├── learning.py           # 已平仓交易统计（供 prompt 参考）
-├── dashboard_server.py   # 看板 HTTP 服务
-├── dashboard.html        # 看板页面（唯一来源）
-├── dashboard.py          # 看板文件检查工具
-├── quant_launcher.py     # 一体化启动器
-├── check_flow.py         # flow 契约检查（只读/脱敏导出）
-├── flow_current.json     # Langflow「A股量化交易分析」优化版
-├── flow_patch/           # 恢复优化版 flow 的工具
-└── tests/                # pytest
-```
+- **直连大模型**：走任意 OpenAI 兼容的 `/chat/completions` 接口，默认 DeepSeek，也可换 Qwen、Kimi 或本地 Ollama。不需要额外部署编排服务。
+- **成本可控**：全市场 5000 多只先按价格、ST、一手金额、往返费用筛掉大半，再用技术规则打分，只有排名靠前的几只真正送进模型。
+- **防交易幻觉**：信号落地前校验标的回显、价格真实性、止损止盈逻辑自洽，自由文本解析额外降权。原则是宁可错过，不可错下单。
+- **A 股规则内建**：T+1、分板块涨跌停、分板块最小交易单位、停牌无行情不成交、涨跌停不追。
+- **FIFO 成本配对**：部分卖出不再重复计入已实现盈亏，浮动盈与已平仓口径一致。
+- **组合回测**：收盘决策、次日开盘成交，叠加滑点与成交量占比约束，自带等权基准、年化、最大回撤、夏普。
+- **实时看板**：内嵌在二进制里，起一个本地 HTTP 服务即可看净值曲线、持仓、信号与跳过原因。
 
 ## 快速开始
 
-### 前置条件
+### 1. 构建
 
-- Python 3.10+
-- [Langflow](https://github.com/langflow-ai/langflow)（用于编排 AI 流程）
-- 一个 DeepSeek API Key
-- 能访问腾讯/新浪/东财行情接口的网络
-
-### 1. 启动 Langflow 并导入 flow
+需要 Rust 1.75+。Linux 下 `native-tls` 依赖 OpenSSL 开发包。
 
 ```bash
-pip install langflow
-langflow run        # 默认 http://127.0.0.1:7860
+cargo build --release
+# 产物：target/release/quant-sim（Windows 为 quant-sim.exe）
 ```
 
-在 Langflow 界面导入 `flow_current.json`，打开 DeepSeek 节点填入自己的 API Key。
-仓库中 `api_key` 是占位符 `sk-REPLACE_WITH_YOUR_DEEPSEEK_API_KEY`，**不要提交真实 Key**。
-
-检查 flow 是否符合客户端要求：
+### 2. 配置 API Key
 
 ```bash
-python check_flow.py
+# bash
+export DEEPSEEK_API_KEY=sk-xxxx
+
+# PowerShell
+$env:DEEPSEEK_API_KEY = "sk-xxxx"
 ```
 
-应看到 `has_as_of: True`、`json_mode: True`、`has_symbol_prompt: True`。如果失败：
+换其他服务商时覆盖地址和模型即可（键名兼容 OpenAI 习惯）：
+
+| 变量 | 说明 | 默认 |
+|---|---|---|
+| `QUANT_SIM_LLM_API_KEY` | 优先级高于 `DEEPSEEK_API_KEY` | 无，必填 |
+| `QUANT_SIM_LLM_BASE_URL` | 兼容 `/chat/completions` 的地址 | `https://api.deepseek.com` |
+| `QUANT_SIM_LLM_MODEL` | 模型名 | `deepseek-chat` |
+| `QUANT_SIM_HOME` | 数据目录，默认取可执行文件同目录或当前目录 | 自动推断 |
+
+Key 只从环境变量读，不写入任何文件，日志里统一显示为 `sk-***`。
+
+### 3. 跑起来
 
 ```bash
-python flow_patch/apply_flow_patch.py
+quant-sim run --once            # 扫描一次（非交易时段默认拒绝）
+quant-sim run --once --force    # 非交易时段强制扫描，用最近收盘价，仅调试
+quant-sim run --loop            # 盘中循环，休市自动等待
+quant-sim summary               # 成绩单
+quant-sim dashboard             # 看板，默认 http://127.0.0.1:8000
+quant-sim backtest --symbol 600000 --days 60
 ```
 
-### 2. 跑模拟盘
+## 命令
 
-```bash
-python main.py run --once          # 立即扫描一次（非交易时段默认拒绝）
-python main.py run --once --force  # 非交易时段强制扫描（用最近收盘价，仅调试）
-python main.py run --loop          # 盘中循环，非交易时段自动等待
-python main.py run --scan 20       # 候选 20 只（实际送 AI 的数量仍受 ai_analyze_n 限制）
-python main.py summary             # 查看成绩单
-python main.py run --reset         # 重置账户（会备份旧 state 和经验库）
-```
+| 命令 | 说明 |
+|---|---|
+| `run --once` / `--loop` | 单次扫描或循环扫描 |
+| `run --scan N` | 每轮候选数 |
+| `run --interval S` | 循环间隔秒数，最小 30 |
+| `run --capital X` | 初始资金，仅新账户生效 |
+| `run --reset` | 重置账户，旧数据会备份 |
+| `run --force` | 忽略交易时段限制 |
+| `summary` | 打印总资产、收益率、持仓、已平仓盈亏、累计手续费 |
+| `reset` | 只重置账户不动看板 |
+| `dashboard --port` / `--host` | 本地看板，仅监听 127.0.0.1 |
+| `backtest --symbol/--symbols` | 单只或多只，逗号分隔 |
+| `backtest --days` / `--decision-every` | 回测长度与决策频率 |
+| `backtest --slippage-bps` / `--max-volume-ratio` | 滑点基点与单笔成交量占比上限 |
 
-### 3. 看板
+`summary`、`dashboard`、`reset` 不需要 API Key。
 
-```bash
-python dashboard_server.py         # http://127.0.0.1:8000
-```
+## 数据源
 
-或一键启动：
+| 用途 | 来源 | 备忘 |
+|---|---|---|
+| 实时行情 | 腾讯 `qt.gtimg.cn` | GBK 编码，中文名需转码 |
+| 日 K 线 | 腾讯 `web.ifzq.gtimg.cn` | 前复权，支持按截止日截断 |
+| 全市场列表 | 新浪 `Market_Center.getHQNodeData` | 分页并发抓取，含备用域名 |
+| 个股新闻 | 东方财富搜索接口 | 标题相关性过滤 + 关键词情感 |
 
-```bash
-python quant_launcher.py
-```
-
-### 4. 回测
-
-```bash
-python backtest.py --symbol 600519 --days 60
-python backtest.py --symbols 600519,000001,300750 --days 120 --decision-every 5
-python backtest.py --symbols 600519,000001 --slippage-bps 5 --max-volume-ratio 0.05
-```
-
-回测结果写入 `data/backtest_result.json`，包含收益、年化、基准、超额、最大回撤、夏普、胜率、交易与净值曲线。
+都是非官方公开接口，可能限流或变更，没有可用性承诺。进程内做了 TTL 缓存：行情 15 秒、K 线 60 秒、列表与新闻 600 秒。
 
 ## 交易规则与费用
 
 | 项目 | 规则 |
 |---|---|
 | 主板 | 100 股整数倍，涨跌停 ±10%，ST ±5% |
-| 创业板/科创板 | 100/200 股起，涨跌停 ±20% |
-| 北交所（4/8/920） | 100 股起、1 股递增，涨跌停 ±30% |
-| T+1 | 买入当日不可卖；`sell` 会拒绝 |
-| 涨停/跌停 | 涨停不买、跌停不卖 |
-| 佣金 | 默认万三、最低 5 元 |
+| 创业板 / 科创板 | ±20%，科创板 200 股起 |
+| 北交所（4 / 8 / 920） | ±30%，100 股起、1 股递增 |
+| T+1 | 买入当日不可卖 |
+| 涨停 / 跌停 | 涨停不买、跌停不卖 |
+| 佣金 | 默认万三，最低 5 元 |
 | 印花税 | 卖出 0.05% |
 | 过户费 | 双边 0.001% |
-| 交易日 | 周末休市；节假日可用 `data/holidays.json` 补充 |
-| 开市判断 | 交易时段 + 上证指数快照日期是今天 |
+| 交易日 | 周末休市，法定节假日读 `data/holidays.json` |
 
-所有参数可在 `state["config"]` 中调整，启动时会校验并修正非法值。
+开市判断不只看时间，还要求上证指数快照的日期是今天，避免节假日误判。
 
-## 配置（`config.py` 默认值）
+## 配置
+
+所有风控与费用参数都存在 `data/state.json` 的 `config` 字段里，启动时校验一次。手改出非法值时不会让整份状态读失败，会逐项回落默认值并打 `[配置校验]` 日志。
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `initial_capital` | 50000 | 初始资金 |
-| `max_positions` | 3 | 最多持仓 |
-| `max_single_position_ratio` | 0.25 | 单票上限 |
-| `stop_loss_pct` / `take_profit_pct` | -5 / 15 | 固定止损止盈；AI 给出有效止损/止盈时优先用 AI 的 |
-| `drawdown_halt_pct` / `halt_recover_pct` | -10 / -5 | 熔断/恢复 |
-| `halt_cooldown_days` | 5 | 熔断冷却天数 |
+| `max_positions` | 3 | 最多持仓只数 |
+| `max_single_position_ratio` | 0.25 | 单票仓位上限 |
+| `stop_loss_pct` / `take_profit_pct` | -5 / 15 | 固定止损止盈；模型给出有效值时优先用模型的 |
+| `drawdown_halt_pct` / `halt_recover_pct` | -10 / -5 | 熔断与恢复 |
+| `halt_cooldown_days` | 5 | 熔断冷却天数，到期自动解除 |
 | `commission_rate` / `min_commission` | 0.0003 / 5 | 佣金 |
 | `stamp_tax_rate` | 0.0005 | 印花税 |
-| `scan_top_n` / `ai_analyze_n` | 10 / 5 | 扫描/送 AI 数量 |
+| `scan_top_n` / `ai_analyze_n` | 10 / 5 | 扫描数与送模型的数量 |
 | `confidence_buy_threshold` | 0.65 | 买入置信门槛 |
-| `confidence_base_ratio` / `max` | 0.15 / 0.25 | 置信度仓位 |
-| `price_tolerance_pct` | 3.0 | AI 价格真实性容忍 |
+| `price_tolerance_pct` | 3.0 | 价格真实性的容忍偏差 |
 
-## 防交易幻觉
+## 防幻觉
 
-`ai_signal.py` 在信号落地前校验：
+信号落地前逐条校验，任一条不过就降级为观望并记录原因：
 
-- **标的**：JSON 回显 `symbol` 必须与请求 6 位代码一致；自由文本提到别的代码但没提目标代码 → 作废。
-- **价格**：AI 陈述的“现价/最新价”与真实行情偏差 > 3% → 判编造。
-- **逻辑**：买入止损不低于现价、卖出止盈不高于现价 → 判矛盾。
-- **低可信**：关键词解析置信度封顶 40%，非“明确建议区”的买卖词作废。
-- 任何幻觉风险的买卖信号不执行，并记录 `⚠幻觉`。
+- **标的**：模型回显的代码必须与请求一致；自由文本里提到了别的股票代码却没提目标代码，视为张冠李戴。
+- **价格**：模型陈述的现价与真实行情偏差超过 3%，判定为编造。
+- **逻辑**：买入信号的止损不低于现价、卖出信号的止盈不高于现价，视为矛盾。
+- **可信度**：走关键词兜底解析的信号置信度封顶 40%，且买卖词必须出现在明确的建议区，正文叙述里的买卖词作废。
 
-离线验证：
+## 目录结构
 
-```bash
-python ai_signal.py selftest
 ```
-
-## 测试
-
-```bash
-python -m pip install pytest
-pytest
+quant-sim/
+├── src/
+│   ├── main.rs           命令行入口
+│   ├── bot.rs            扫描循环、信号冷却、单实例锁
+│   ├── backtest.rs       组合回测
+│   ├── simulator.rs      撮合、费用、持仓、净值
+│   ├── indicators.rs     MA/RSI/MACD/ATR/量比与规则打分
+│   ├── rules.rs          板块、涨跌停、交易单位、T+1
+│   ├── market.rs         行情与 K 线
+│   ├── news.rs           新闻抓取与情感
+│   ├── llm.rs            大模型客户端
+│   ├── signal.rs         信号解析与防幻觉
+│   ├── store.rs          状态持久化
+│   ├── config.rs         配置与校验
+│   ├── calendar.rs       交易日历
+│   ├── learner.rs        已平仓统计与经验沉淀
+│   └── dashboard.rs      看板服务
+├── dashboard.html        看板页面，编译时内嵌
+└── data/                 运行时生成：state.json、experience.json、heartbeat.json
 ```
-
-CI：`.github/workflows/ci.yml`，Python 3.10/3.12。
 
 ## 已知限制
 
-- 数据源是腾讯/新浪/东财的**非官方公开接口**，可能限流、变更或失效；没有 SLA。
-- 没有逐笔/盘口/集合竞价撮合，无法模拟排队、部分成交、冲击成本；回测用开盘价 + 滑点 + 成交量占比近似。
-- **未处理除权除息/送转**：长周期持有遇到除权日会失真；回测用前复权 K 线，实盘模拟用原始报价。
-- 新闻只做标题相关性 + 关键词情感，不是完整舆情/公告/财报分析。
-- LLM 输出不可复现：同样的数据可能给出不同信号；回测结果依赖模型版本与温度。
-- 节假日默认只排除周末；请按年份维护 `data/holidays.json`。
-- 这是模拟盘，不连接券商、不涉及真实资金。
+- 数据源是非官方公开接口，可能限流、变更或失效。
+- 回测与实盘模拟都受仓位上限约束：标的一手金额超过「单票仓位上限」时永远买不进。用 5 万本金跑 600519（一手约 14 万）必然是空仓，这类回测只能验证基准，验证不了策略。
+- 没有逐笔与盘口撮合，无法模拟排队、部分成交和冲击成本；回测用开盘价加滑点近似。
+- 未处理除权除息，长周期持有跨越除权日会失真；回测用前复权 K 线，实盘模拟用原始报价。
+- 新闻只做标题相关性与关键词情感，不是完整舆情分析。
+- 大模型输出不可复现，同样数据可能给出不同信号，回测结果依赖模型版本与温度。
+- 节假日默认只排除周末，需要按年份维护 `data/holidays.json`。
 
 ## License
 
