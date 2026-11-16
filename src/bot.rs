@@ -1045,8 +1045,8 @@ pub fn print_report(sim: &Simulator, report: &ScanReport) {
     }
 }
 
-/// f64 求和/取整会产生负零（-0.0），直接 `{:.2}` 会打印成 "-0.00"。
-/// 金额展示统一归零，避免成绩单出现 "-0.00" 这种看着像 bug 的输出。
+/// f64 的负零会渲染成 "-0.00"，看着像 bug。`simulator::summary()` 已在源头归一，
+/// 这里再兜一层：任何将来新增的金额字段经过成绩单都不会露出 "-0.00"。
 fn money(value: f64) -> f64 {
     if value == 0.0 {
         0.0

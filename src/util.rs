@@ -41,12 +41,20 @@ pub fn ymd(d: NaiveDate) -> String {
 }
 
 /// 四舍五入到指定位数，半远离零（Rust `f64::round` 即是该规则）。
+///
+/// 结果为零时统一归一为正零：IEEE 里 `(-0.0001 * 100.0).round()` 是负零，
+/// `{:.2}` 会渲染成 "-0.00"，金额与百分比场景一律不该出现这种负数零。
 pub fn round_to(v: f64, digits: u32) -> f64 {
     if !v.is_finite() {
         return v;
     }
     let factor = 10f64.powi(digits as i32);
-    (v * factor).round() / factor
+    let rounded = (v * factor).round() / factor;
+    if rounded == 0.0 {
+        0.0
+    } else {
+        rounded
+    }
 }
 
 pub fn parse_date(s: &str) -> Option<NaiveDate> {
@@ -238,6 +246,14 @@ mod tests {
         assert_eq!(round_to(0.8, 4), 0.8);
         // 1.005 在 f64 里其实是 1.00499999999999989，先乘后除只能得到 1.0。
         assert_eq!(round_to(1.005, 2), 1.0);
+        // 负数零必须归一：否则金额会打印成 "-0.00"
+        assert_eq!(round_to(-0.0001, 2), 0.0);
+        assert!(round_to(-0.0001, 2).is_sign_positive());
+        assert_eq!(round_to(-0.004, 1), 0.0);
+        assert!(round_to(-0.004, 1).is_sign_positive());
+        // 真负数不能被误伤
+        assert_eq!(round_to(-0.006, 2), -0.01);
+        assert!(round_to(-0.006, 2).is_sign_negative());
         assert!(round_to(f64::NAN, 2).is_nan());
     }
 
