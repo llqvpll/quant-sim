@@ -9,7 +9,7 @@ use std::rc::Rc;
 use serde::Serialize;
 
 use crate::calendar::Calendar;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::indicators;
 use crate::rules;
 use crate::signal::{AnalyzeRequest, GroundOptions, SignalAction};
@@ -18,6 +18,7 @@ use crate::sizing;
 use crate::store::{self, NetValue, Order, Paths};
 use crate::types::{AiSource, Bar, MarketSource};
 use crate::util;
+use crate::walk;
 
 /// 每个标的至少要有的 K 线根数，太短算不出指标。
 const MIN_ROWS: usize = 40;
@@ -55,6 +56,10 @@ pub struct BacktestSettings {
     pub ai_model: String,
     /// 使用的行情快照 id；None 表示读实时行情，结果会随新 K 线漂移。
     pub snapshot_id: Option<String>,
+    /// 滚动窗口数；0 为单段回测，>=2 走滚动样本外检验。
+    pub walk_windows: usize,
+    /// 显式传入 --days 时的总交易日上限；None 表示用满可用区间。
+    pub walk_days_limit: Option<usize>,
 }
 
 impl Default for BacktestSettings {
@@ -70,6 +75,8 @@ impl Default for BacktestSettings {
             replay: false,
             ai_model: String::new(),
             snapshot_id: None,
+            walk_windows: 0,
+            walk_days_limit: None,
         }
     }
 }
@@ -186,6 +193,12 @@ pub struct BacktestResult {
     pub error: Option<String>,
 }
 
+/// 滚动检验的完整输出：报告落盘用，逐段结果供调用方核查。
+pub struct WalkRun {
+    pub report: walk::WalkReport,
+    pub results: Vec<BacktestResult>,
+}
+
 pub struct Backtest<'a, M: MarketSource, A: AiSource> {
     symbols: Vec<String>,
     days: usize,
@@ -253,7 +266,8 @@ impl<'a, M: MarketSource, A: AiSource> Backtest<'a, M, A> {
         }
     }
 
-    pub fn run(&mut self) -> AppResult<BacktestResult> {
+    /// 日志与信号输入的准备动作，单段与多窗口共用，保证两条路径的前置输出一致。
+    fn prepare(&mut self) {
         let signals_path = self.paths.backtest_signals();
         if self.settings.replay {
             self.replay_raw = read_signal_log(&signals_path);
@@ -275,6 +289,10 @@ impl<'a, M: MarketSource, A: AiSource> Backtest<'a, M, A> {
             Some(id) => util::log(&format!("[回测] 行情快照 {id}（离线，区间固定）")),
             None => util::log("[回测] 实时行情：区间会随新K线漂移，跨版本对比请先创建快照"),
         }
+    }
+
+    pub fn run(&mut self) -> AppResult<BacktestResult> {
+        self.prepare();
         if !self.load() {
             return Ok(self.failure("K线数据不足或标的为空"));
         }
@@ -287,8 +305,25 @@ impl<'a, M: MarketSource, A: AiSource> Backtest<'a, M, A> {
             return Ok(self.failure("回测区间太短"));
         }
 
-        // 每次回测都用全新账户，旧的专用状态文件先删掉再建
-        let slug = util::hash8(&self.symbols.join(","));
+        let mut result = self.execute_segment(&days, "")?;
+        self.persist(&mut result)?;
+        Ok(result)
+    }
+
+    /// 单段执行：独立账户、独立状态文件、独立计数。单段模式 slug 后缀为空，
+    /// 状态文件名与原来完全一致；多窗口时加后缀避免互相覆盖。
+    fn execute_segment(&mut self, days: &[String], slug_suffix: &str) -> AppResult<BacktestResult> {
+        self.pending.clear();
+        self.trades.clear();
+        self.ai_calls = 0;
+        self.ai_errors = 0;
+
+        let base_slug = util::hash8(&self.symbols.join(","));
+        let slug = if slug_suffix.is_empty() {
+            base_slug
+        } else {
+            format!("{base_slug}-{slug_suffix}")
+        };
         let state_path = self.paths.backtest_state(&slug);
         if state_path.exists() {
             let _ = std::fs::remove_file(&state_path);
@@ -318,7 +353,85 @@ impl<'a, M: MarketSource, A: AiSource> Backtest<'a, M, A> {
         let last_day = days[days.len() - 1].clone();
         self.liquidate(&last_day, &mut sim);
         sim.snapshot(Some(&last_day))?;
-        self.collect(&days, &last_day, &sim)
+        self.collect(days, &last_day, &sim)
+    }
+
+    /// 一次取数、切成 N 个连续不重叠窗口，各自用独立账户跑一遍。
+    /// 不覆盖单段结果文件，只写 data/backtest_walk.json。
+    pub fn run_walk(&mut self) -> AppResult<WalkRun> {
+        self.prepare();
+        if walk::needs_drift_warning(&self.settings.snapshot_id, self.settings.walk_windows) {
+            util::log("[警告] 实时行情下窗口边界会随新K线漂移，跨版本对比请先创建快照");
+        }
+        if !self.load() {
+            return Err(AppError::Invalid("K线数据不足或标的为空".to_string()));
+        }
+        let Some(start) = self.start_index() else {
+            return Err(AppError::Invalid(
+                "无法找到所有标的同时具备 30 根 K 线的起点".to_string(),
+            ));
+        };
+        // 显式传 --days 才限制检验区间；不传则用满快照可用区间，避免默认天数悄悄砍掉历史。
+        let available_count = self.dates.len().saturating_sub(start);
+        let total = self
+            .settings
+            .walk_days_limit
+            .map(|limit| limit.min(available_count))
+            .unwrap_or(available_count);
+        let windows = self.settings.walk_windows;
+        util::log(&format!(
+            "[回测] 滚动窗口使用 {total} 个交易日（快照可用 {available_count} 天）"
+        ));
+        walk::validate_window_size(total, windows, MIN_RANGE_DAYS).map_err(|err| {
+            AppError::Invalid(format!("{err}；当前共 {total} 个交易日、{windows} 段"))
+        })?;
+        let usable: Vec<String> = self.dates[start..start + total].to_vec();
+        let parts =
+            walk::split_windows(&usable, windows, MIN_RANGE_DAYS).map_err(AppError::Invalid)?;
+
+        let mut results: Vec<BacktestResult> = Vec::with_capacity(parts.len());
+        for (index, days) in parts.iter().enumerate() {
+            let result = self.execute_segment(days, &format!("w{}", index + 1))?;
+            results.push(result);
+        }
+        let excess: Vec<f64> = results.iter().map(|item| item.excess_return_pct).collect();
+        let totals: Vec<f64> = results.iter().map(|item| item.total_return_pct).collect();
+        let segments: Vec<walk::WalkSegment> = results
+            .iter()
+            .enumerate()
+            .map(|(index, item)| walk::WalkSegment {
+                index: index + 1,
+                start: item.start.clone(),
+                end: item.end.clone(),
+                trading_days: item.trading_days,
+                total_return_pct: item.total_return_pct,
+                benchmark_return_pct: item.benchmark_return_pct,
+                excess_return_pct: item.excess_return_pct,
+                max_drawdown_pct: item.max_drawdown_pct,
+                sharpe: item.sharpe,
+                sortino: item.sortino,
+                trades: item.trades.len(),
+                win_rate: item.win_rate,
+            })
+            .collect();
+        let report = walk::WalkReport {
+            snapshot_id: self.settings.snapshot_id.clone(),
+            symbols: self.symbols.clone(),
+            benchmark: self.benchmark_code.clone(),
+            windows,
+            decision_every: self.decision_every,
+            slippage_bps: self.slippage_bps,
+            segments,
+            summary: walk::summary(&excess, &totals),
+        };
+        let path = self.paths.backtest_walk();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let text = serde_json::to_string_pretty(&report)?;
+        std::fs::write(&path, format!("{text}\n"))?;
+        walk::print_report(&report);
+        Ok(WalkRun { report, results })
     }
 
     // ---------- 数据 ----------
@@ -411,7 +524,7 @@ impl<'a, M: MarketSource, A: AiSource> Backtest<'a, M, A> {
             // 这种不存在的价格。
             // 取整会让小额滑点被吸收：0.01 的最小变动意味着 5bp 滑点要推动一个 tick
             // 需价格 ≥10 元，低价股的成交价会等于开盘价。这是预期行为，不是滑点未生效；
-            // 验证滑点链路请用 50bp 或 10 元以上的标的。
+            // 观察滑点链路请用 50bp 或 10 元以上的标的。
             let price = if order.action == "BUY" {
                 rules::round_price(open * (1.0 + self.slippage_bps / 10_000.0))
             } else {
@@ -812,7 +925,7 @@ impl<'a, M: MarketSource, A: AiSource> Backtest<'a, M, A> {
         let yearly = yearly_returns(&sim.state.daily_net_values);
         let consecutive_loss = max_consecutive_loss_days(&net_values);
 
-        let mut result = BacktestResult {
+        let result = BacktestResult {
             symbols: self.symbols.clone(),
             start: days[0].clone(),
             end: last_day.to_string(),
@@ -847,16 +960,22 @@ impl<'a, M: MarketSource, A: AiSource> Backtest<'a, M, A> {
             error: None,
         };
 
+        Ok(result)
+    }
+
+    /// 单段落盘：结果文件、manifest、结果路径回填与报告打印。
+    /// 多窗口不调用它，避免每段覆盖同一个结果文件。
+    fn persist(&self, result: &mut BacktestResult) -> AppResult<()> {
         let path = self.paths.backtest_result();
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let text = serde_json::to_string_pretty(&result)?;
+        let text = serde_json::to_string_pretty(result)?;
         std::fs::write(&path, format!("{text}\n"))?;
-        self.write_manifest(&result)?;
+        self.write_manifest(result)?;
         result.output = Some(path.display().to_string());
-        print_report(&result);
-        Ok(result)
+        print_report(result);
+        Ok(())
     }
 
     fn write_manifest(&self, result: &BacktestResult) -> AppResult<()> {
@@ -1629,7 +1748,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&paths.base_dir);
     }
 
-    /// 真实行情冒烟：不调 AI（无 Key 也能跑），只验证数据加载、次日开盘成交、落盘与指标。
+    /// 真实行情冒烟：不调 AI（无 Key 也能跑），只检查数据加载、次日开盘成交、落盘与指标。
     #[test]
     #[ignore = "需要联网取真实 K 线，手动用 --ignored 运行"]
     fn live_backtest_with_real_kline() {
@@ -1663,7 +1782,7 @@ mod tests {
             result.trades.len()
         );
 
-        // 低价股才能真成交，用它验证“次日开盘价成交”在真实数据上成立
+        // 低价股才能真成交，用它核对“次日开盘价成交”在真实数据上成立
         let mut bt = Backtest::new(
             &mut md,
             &ai,
@@ -2047,6 +2166,62 @@ mod tests {
         .expect("manifest 合法");
         assert_eq!(manifest["deterministic"], true);
         assert_eq!(manifest["ai_model"], "fake-model");
+        let _ = std::fs::remove_dir_all(&paths.base_dir);
+    }
+    /// 多窗口时每段必须是独立账户、独立计数，且单段结果文件不被覆盖。
+    #[test]
+    fn segments_have_independent_accounts() {
+        let paths = temp_paths("walk-independence");
+        let mut market = fake_market(make_rows(181, 10.0));
+        let ai = FakeAi;
+        let mut settings =
+            BacktestSettings::new(vec!["600000".to_string()], 60, 5, Some(50_000.0), 0.0, 0.05);
+        settings.walk_windows = 2;
+        settings.snapshot_id = Some("unit-snapshot".to_string());
+        let mut bt = Backtest::new(
+            &mut market,
+            &ai,
+            &paths,
+            Rc::new(Calendar::empty()),
+            settings,
+        );
+        let run = bt.run_walk().expect("滚动检验可运行");
+        assert_eq!(run.report.windows, 2);
+        assert_eq!(run.results.len(), 2);
+        let first = &run.results[0];
+        let second = &run.results[1];
+        assert_eq!(first.initial, 50_000.0);
+        assert_eq!(second.initial, 50_000.0);
+        assert!(!first.trades.is_empty(), "第一段必须有成交");
+        assert!(!second.trades.is_empty(), "第二段必须有成交");
+        assert!(first.end < second.start, "窗口必须连续且不重叠");
+        for trade in &second.trades {
+            assert!(
+                trade.date >= second.start,
+                "第二段成交 {} 早于起点 {}",
+                trade.date,
+                second.start
+            );
+        }
+        // 每 5 个交易日最多决策一次（风控挂单会让部分决策日跳过），
+        // 因此本段决策日数就是 AI 调用数的上界；跨段累加必然越过这个上界。
+        let first_cap = first.trading_days.div_ceil(5);
+        let second_cap = second.trading_days.div_ceil(5);
+        assert!(first.ai_calls > 0 && first.ai_calls as usize <= first_cap);
+        assert!(second.ai_calls > 0 && second.ai_calls as usize <= second_cap);
+        assert!(
+            !paths.backtest_result().exists(),
+            "多窗口不得覆盖单段结果文件"
+        );
+        assert!(paths.backtest_walk().exists());
+        let report: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(paths.backtest_walk()).expect("读 walk 报告"),
+        )
+        .expect("walk 报告合法");
+        assert_eq!(report["windows"], 2);
+        assert_eq!(report["segments"].as_array().map(|v| v.len()), Some(2));
+        assert_eq!(report["segments"][0]["index"], 1);
+        assert_eq!(report["segments"][1]["index"], 2);
         let _ = std::fs::remove_dir_all(&paths.base_dir);
     }
 }

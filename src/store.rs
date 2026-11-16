@@ -100,6 +100,10 @@ impl Paths {
         self.data_dir().join("backtest_signals.jsonl")
     }
 
+    pub fn backtest_walk(&self) -> PathBuf {
+        self.data_dir().join("backtest_walk.json")
+    }
+
     pub fn snapshots_dir(&self) -> PathBuf {
         self.data_dir().join("snapshots")
     }

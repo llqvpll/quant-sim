@@ -24,6 +24,7 @@ mod snapshot;
 mod store;
 mod types;
 mod util;
+mod walk;
 
 use std::rc::Rc;
 use std::time::Duration;
@@ -122,6 +123,10 @@ enum Cmd {
         /// 使用本地行情快照（快照 id 或 latest），不联网取行情
         #[arg(long)]
         snapshot: Option<String>,
+        /// 滚动窗口数，>=2 时切成互不重叠的连续窗口各跑一遍；
+        /// 多窗口模式下 --days 为参与检验的总交易日上限，不传则用满快照可用区间
+        #[arg(long)]
+        walk: Option<u32>,
     },
     /// 管理本地行情快照
     Snapshot {
@@ -184,6 +189,7 @@ fn dispatch(cli: Cli) -> AppResult<()> {
             benchmark,
             replay,
             snapshot,
+            walk,
         } => {
             let args = BacktestCliArgs {
                 symbol,
@@ -196,6 +202,7 @@ fn dispatch(cli: Cli) -> AppResult<()> {
                 benchmark,
                 replay,
                 snapshot,
+                walk,
             };
             cmd_backtest(&args)
         }
@@ -222,6 +229,7 @@ struct BacktestCliArgs {
     benchmark: String,
     replay: bool,
     snapshot: Option<String>,
+    walk: Option<u32>,
 }
 
 fn cmd_run(
@@ -377,13 +385,27 @@ fn cmd_backtest(args: &BacktestCliArgs) -> AppResult<()> {
     settings.replay = args.replay;
     settings.ai_model = ai_model;
     settings.snapshot_id = snapshot_id;
+    settings.walk_windows = walk::validate_walk_arg(args.walk).map_err(AppError::Invalid)?;
+    settings.walk_days_limit = args.days.map(|value| value as usize);
     let mut engine = Backtest::new(&mut source, &ai, &paths, Rc::clone(&cal), settings);
+    if engine_walks(args.walk) {
+        // 多窗口只写 backtest_walk.json，不覆盖单段结果文件。
+        let walk = engine.run_walk()?;
+        if walk.results.len() != walk.report.windows {
+            return Err(AppError::Invalid("滚动窗口段数与报告不一致".to_string()));
+        }
+        return Ok(());
+    }
     // 回测的头部与结果行（含结果文件路径）由 Backtest::run 自己打印，这里不重复。
     let result = engine.run()?;
     match result.error {
         Some(error) => Err(AppError::Business(error)),
         None => Ok(()),
     }
+}
+
+fn engine_walks(walk: Option<u32>) -> bool {
+    walk.unwrap_or(0) >= 2
 }
 
 fn cmd_snapshot_create(symbols: &str, days: Option<u32>, benchmark: &str) -> AppResult<()> {
@@ -534,6 +556,7 @@ mod tests {
                 benchmark,
                 replay,
                 snapshot,
+                walk,
             } => {
                 assert_eq!(symbol, "600519");
                 assert_eq!(symbols, "");
@@ -545,6 +568,7 @@ mod tests {
                 assert_eq!(benchmark, "000300");
                 assert!(!replay);
                 assert!(snapshot.is_none());
+                assert!(walk.is_none());
             }
             _ => panic!("应解析为 backtest 子命令"),
         }
